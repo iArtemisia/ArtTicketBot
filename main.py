@@ -675,6 +675,10 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
     @app_commands.command(name="setup", description="Set the ticket category and log channel for this server.")
     @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        category="Category where private ticket channels will be created",
+        log_channel="Text channel where ticket logs and transcripts will be sent",
+    )
     async def setup_ticket(
         self,
         interaction: discord.Interaction,
@@ -685,8 +689,15 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
 
-        real_category = interaction.guild.get_channel(category.id)
-        real_log_channel = interaction.guild.get_channel(log_channel.id)
+        try:
+            real_category = category.resolve() or await category.fetch()
+        except discord.HTTPException:
+            real_category = None
+
+        try:
+            real_log_channel = log_channel.resolve() or await log_channel.fetch()
+        except discord.HTTPException:
+            real_log_channel = None
 
         if not isinstance(real_category, discord.CategoryChannel):
             picked_type = getattr(category, "type", "unknown")
@@ -723,12 +734,12 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         await interaction.response.send_message(
             (
                 "Saved ticket setup for this server.\n\n"
-                f"**Ticket category:** {real_category.mention}\n"
+                f"**Ticket category:** {real_category.name}\n"
                 "Used for newly created private ticket channels.\n\n"
                 f"**Log channel:** {real_log_channel.mention}\n"
                 "Used for ticket logs and transcripts.\n\n"
                 f"**Staff roles configured:** {len(config.get('staff_role_ids', []))}\n\n"
-                "Use `/ticket panel` in the channel where you want the ticket embed posted."
+                "Run `/ticket panel` in the channel where you want the ticket embed posted."
             ),
             ephemeral=True,
         )
