@@ -41,6 +41,15 @@ TICKET_TYPES: dict[str, dict[str, str]] = {
     },
 }
 
+SetupChannel = (
+    discord.TextChannel
+    | discord.VoiceChannel
+    | discord.StageChannel
+    | discord.CategoryChannel
+    | discord.ForumChannel
+    | discord.Thread
+)
+
 
 # --------------------------------------------------
 # Per-guild config store
@@ -693,11 +702,33 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
     async def setup_ticket(
         self,
         interaction: discord.Interaction,
-        category: discord.CategoryChannel,
-        log_channel: discord.TextChannel,
+        category: SetupChannel,
+        log_channel: SetupChannel,
     ) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        if not isinstance(category, discord.CategoryChannel):
+            picked_type = getattr(category, "type", "unknown")
+            await interaction.response.send_message(
+                (
+                    "The **category** option must be a real Discord category.\n"
+                    f"You picked: {category.mention} (`{picked_type}`)"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(log_channel, discord.TextChannel):
+            picked_type = getattr(log_channel, "type", "unknown")
+            await interaction.response.send_message(
+                (
+                    "The **log_channel** option must be a normal text channel.\n"
+                    f"You picked: {log_channel.mention} (`{picked_type}`)"
+                ),
+                ephemeral=True,
+            )
             return
 
         current = self.bot.config_store.get_guild(interaction.guild.id)
@@ -826,12 +857,20 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
     ) -> None:
         if isinstance(error, app_commands.MissingPermissions):
             message = "You do not have permission to use that command."
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-            return
-        raise error
+        elif isinstance(error, app_commands.TransformerError):
+            message = (
+                "One of the options you picked was the wrong type.\n"
+                "For `/ticket setup`, choose:\n"
+                "- a real **category** for `category`\n"
+                "- a normal **text channel** for `log_channel`"
+            )
+        else:
+            raise error
+
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
 
 
 # --------------------------------------------------
