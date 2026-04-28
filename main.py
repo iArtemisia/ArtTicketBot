@@ -966,7 +966,7 @@ async def create_ticket_channel(
         if priority
         else "Thanks for opening a ticket. A staff member will help you soon.\n\n"
     )
-    description += "Available buttons: **Ping Team**, **Claim**, **Unclaim**, and **Close**."
+    description += "Users can use **Ping Team** with a 10-minute cooldown. Staff can run `/ticket controls` for **Claim**, **Unclaim**, and **Close**."
 
     embed = discord.Embed(
         title=f"{config['emoji']} {title_prefix}",
@@ -1338,9 +1338,9 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             await interaction.response.send_message("This does not look like a valid ticket channel.", ephemeral=True)
             return
 
-        if interaction.user.id != owner_id and not member_is_staff(self.bot, interaction.user):
+        if not member_is_staff(self.bot, interaction.user):
             await interaction.response.send_message(
-                "Only the ticket owner or ticket staff can close this ticket.",
+                "Only ticket staff can close this ticket.",
                 ephemeral=True,
             )
             return
@@ -1440,6 +1440,14 @@ class TicketPanelView(discord.ui.View):
 
 
 class TicketChannelView(discord.ui.View):
+    """Public ticket controls.
+
+    Discord does not support hiding individual buttons from only some users on one shared
+    message. To keep normal users from seeing staff-only controls, the public ticket
+    message only has Ping Team. Staff use `/ticket controls` inside the ticket to open
+    an ephemeral staff-only control panel with Claim, Unclaim, and Close.
+    """
+
     def __init__(self, bot: "TicketBot"):
         super().__init__(timeout=None)
         self.bot = bot
@@ -1490,19 +1498,34 @@ class TicketChannelView(discord.ui.View):
         )
         await interaction.response.send_message("Pinged the configured ticket roles. This ticket can ping again in 10 minutes.", ephemeral=True)
 
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="ticket:claim", row=0)
-    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+
+class StaffTicketControlsView(discord.ui.View):
+    """Ephemeral staff-only controls for a ticket channel."""
+
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(timeout=300)
+        self.bot = bot
+
+    async def _get_staff_ticket_channel(self, interaction: discord.Interaction) -> Optional[discord.TextChannel]:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
-            return
+            return None
 
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
             await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
-            return
+            return None
 
         if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can claim tickets.", ephemeral=True)
+            await interaction.response.send_message("Only ticket staff can use these controls.", ephemeral=True)
+            return None
+
+        return channel
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, row=0)
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = await self._get_staff_ticket_channel(interaction)
+        if channel is None or interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return
 
         claimed_by = get_claimed_by_id(channel)
@@ -1525,19 +1548,10 @@ class TicketChannelView(discord.ui.View):
         await channel.send(f"📌 Ticket claimed by {interaction.user.mention} (`{interaction.user.id}`).")
         await interaction.response.send_message("You claimed this ticket.", ephemeral=True)
 
-    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.secondary, custom_id="ticket:unclaim", row=0)
+    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.secondary, row=0)
     async def unclaim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
-            return
-
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
-            return
-
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can unclaim tickets.", ephemeral=True)
+        channel = await self._get_staff_ticket_channel(interaction)
+        if channel is None or interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return
 
         claimed_by = get_claimed_by_id(channel)
@@ -1562,15 +1576,13 @@ class TicketChannelView(discord.ui.View):
         await channel.send(f"📌 Ticket unclaimed by {interaction.user.mention} (`{interaction.user.id}`).")
         await interaction.response.send_message("You unclaimed this ticket.", ephemeral=True)
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="ticket:close", row=0)
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=0)
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+        channel = await self._get_staff_ticket_channel(interaction)
+        if channel is None:
             return
 
         await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
-
 
 class ConfigRoleSelect(discord.ui.Select):
     def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str):
@@ -2021,6 +2033,36 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         msg = "Created" if status == "created" else "Opened existing"
         await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
 
+    @app_commands.command(name="controls", description="Open staff-only controls for the current ticket.")
+    async def ticket_controls(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("Use `/ticket controls` inside a ticket channel.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can open ticket controls.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="Staff Ticket Controls",
+            description=(
+                "These controls are only shown to you. Regular users only see the public **Ping Team** button.\n\n"
+                "Use **Claim** when you are handling the ticket, **Unclaim** if you need to release it, or **Close** when finished."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="Ticket", value=channel.mention, inline=False)
+        embed.add_field(name="Ticket Number", value=f"`{get_ticket_number(channel)}`", inline=True)
+        embed.add_field(name="Ticket Type", value=get_ticket_kind(channel).title(), inline=True)
+        embed.add_field(name="Claimed By", value=format_user_reference(interaction.guild, get_claimed_by_id(channel)), inline=False)
+        await interaction.response.send_message(embed=embed, view=StaffTicketControlsView(self.bot), ephemeral=True)
+
     @app_commands.command(name="admin", description="Open the ticket admin control panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def ticket_admin(self, interaction: discord.Interaction) -> None:
@@ -2054,7 +2096,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="Ticket buttons: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Use `/ticket notes` for staff notes.",
+            value="User-facing ticket button: **Ping Team** with a 10-minute cooldown. Staff can use `/ticket controls` for **Claim**, **Unclaim**, and **Close**, and `/ticket notes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
@@ -2094,7 +2136,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
         embed.add_field(
             name="Inside the ticket",
-            value="Buttons included: **Ping Team** with a 10-minute cooldown, **Claim**, **Unclaim**, and **Close**.",
+            value="User-facing button: **Ping Team** with a 10-minute cooldown. Staff controls are opened with `/ticket controls` inside the ticket.",
             inline=False,
         )
         panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
