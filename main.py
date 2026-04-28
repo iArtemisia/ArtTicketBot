@@ -23,6 +23,7 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
+TICKET_PING_COOLDOWN_SECONDS = 10 * 60
 
 TICKET_CONFIG: dict[str, str] = {
     "label": "Open Ticket",
@@ -407,7 +408,7 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
         timestamp=now_utc(),
     )
     embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
-    embed.add_field(name="Log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
+    embed.add_field(name="Closed-ticket log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
     embed.add_field(
         name="Default staff roles",
         value="\n".join(role.mention for role in staff_roles) if staff_roles else "None",
@@ -747,9 +748,9 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
     except discord.HTTPException:
         return None, "Discord refused the ticket channel create request. Try again in a moment."
 
-    opening_mentions = " ".join(
-        part for part in [interaction.user.mention, mention_roles(ping_roles)] if part
-    ).strip()
+    # Keep ticket creation confirmation private/ephemeral.
+    # Do not post a permanent "user opened a ticket" ping line in the ticket channel.
+    opening_mentions = None
 
     embed = discord.Embed(
         title=f"{TICKET_CONFIG['emoji']} {TICKET_CONFIG['label']}",
@@ -770,23 +771,12 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
             content=opening_mentions,
             embed=embed,
             view=TicketChannelView(bot),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
     except discord.Forbidden:
         return None, "I created the channel but couldn't post the starter message. Check the category/channel permissions."
     except discord.HTTPException:
         return None, "I created the channel but Discord rejected the starter message."
-
-    try:
-        await log_event(
-            bot,
-            guild,
-            title="Ticket Opened",
-            description=f"Channel: {channel.mention}\nUser: {interaction.user.mention}",
-            color=discord.Color.green(),
-        )
-    except discord.HTTPException:
-        pass
 
     return channel, "created"
 
@@ -1261,23 +1251,40 @@ class TicketChannelView(discord.ui.View):
             await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
             return
 
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can ping the team here.", ephemeral=True)
+        owner_id = get_ticket_owner_id(channel)
+        is_owner = owner_id == interaction.user.id
+        is_staff = member_is_staff(self.bot, interaction.user)
+        if not is_owner and not is_staff:
+            await interaction.response.send_message("Only the ticket owner or ticket staff can ping the team here.", ephemeral=True)
             return
+
+        last_ping = self.bot.ticket_ping_cooldowns.get(channel.id)
+        if last_ping is not None:
+            elapsed = (now_utc() - last_ping).total_seconds()
+            remaining = int(TICKET_PING_COOLDOWN_SECONDS - elapsed)
+            if remaining > 0:
+                minutes = remaining // 60
+                seconds = remaining % 60
+                await interaction.response.send_message(
+                    f"Ping Team is on cooldown for this ticket. Try again in {minutes}m {seconds}s.",
+                    ephemeral=True,
+                )
+                return
 
         ping_roles = get_ticket_ping_roles(self.bot, interaction.guild, channel)
         if not ping_roles:
             await interaction.response.send_message(
-                "No ticket ping roles are set. Use **Set Ping Roles** or `/ticket addpingrole`.",
+                "No ticket ping roles are set. Staff can use **Set Ping Roles** or `/ticket addpingrole`.",
                 ephemeral=True,
             )
             return
 
+        self.bot.ticket_ping_cooldowns[channel.id] = now_utc()
         await channel.send(
-            f"📣 {interaction.user.mention} pinged: {mention_roles(ping_roles)}",
+            f"📣 {interaction.user.mention} requested staff attention: {mention_roles(ping_roles)}",
             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
         )
-        await interaction.response.send_message("Pinged the configured ticket roles.", ephemeral=True)
+        await interaction.response.send_message("Pinged the configured ticket roles. This ticket can ping again in 10 minutes.", ephemeral=True)
 
     @discord.ui.button(label="Set Ping Roles", style=discord.ButtonStyle.secondary, custom_id="ticket:set_ping_roles", row=0)
     async def set_ping_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1288,23 +1295,8 @@ class TicketChannelView(discord.ui.View):
 
         await interaction.response.send_modal(SetPingRolesModal(self.bot, channel))
 
-    @discord.ui.button(label="Add User", style=discord.ButtonStyle.secondary, custom_id="ticket:add_user", row=1)
-    async def add_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
-            return
-
-        await interaction.response.send_modal(AddUserModal(self.bot, channel))
-
-    @discord.ui.button(label="Remove User", style=discord.ButtonStyle.secondary, custom_id="ticket:remove_user", row=1)
-    async def remove_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
-            return
-
-        await interaction.response.send_modal(RemoveUserModal(self.bot, channel))
+    # Add/Remove User are intentionally not exposed as public ticket buttons.
+    # They remain protected helper modals for future staff-only workflows.
 
     @discord.ui.button(label="Add Role", style=discord.ButtonStyle.secondary, custom_id="ticket:add_role", row=2)
     async def add_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1494,11 +1486,11 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         self.bot = bot
         super().__init__()
 
-    @app_commands.command(name="setup", description="Set the ticket category and log channel for this server.")
+    @app_commands.command(name="setup", description="Set the ticket category and closed-ticket log channel for this server.")
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
         category="Category where private ticket channels will be created",
-        log_channel="Text channel where ticket logs and transcripts will be sent",
+        log_channel="Text channel where CLOSED ticket logs and transcript files will be sent",
     )
     async def setup_ticket(
         self,
@@ -1537,7 +1529,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.response.send_message(
                 (
                     "The **log_channel** option must be a normal text channel.\n"
-                    "This is where ticket open/close logs and transcripts are sent.\n\n"
+                    "This is where CLOSED ticket logs and transcript files are sent.\n\n"
                     f"You picked: {log_channel.mention} (`{picked_type}`)"
                 ),
                 ephemeral=True,
@@ -1559,8 +1551,8 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 "Saved ticket setup for this server.\n\n"
                 f"**Ticket category:** {real_category.name}\n"
                 "Used for newly created private ticket channels.\n\n"
-                f"**Log channel:** {real_log_channel.mention}\n"
-                "Used for ticket logs and transcripts.\n\n"
+                f"**Closed-ticket log channel:** {real_log_channel.mention}\n"
+                "Used when tickets close. The transcript file will be posted there automatically.\n\n"
                 f"**Staff roles configured:** {len(config.get('staff_role_ids', []))}\n\n"
                 "Run `/ticket panel` in the channel where you want the ticket embed posted."
             ),
@@ -1752,28 +1744,6 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         msg = "Created" if status == "created" else "Opened existing"
         await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
 
-    @app_commands.command(name="log", description="Download a saved ticket transcript by ticket ID/channel ID.")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def ticket_log(self, interaction: discord.Interaction, ticket_id: str) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-            return
-
-        safe_ticket_id = re.sub(r"[^0-9]", "", ticket_id)
-        if not safe_ticket_id:
-            await interaction.response.send_message("Use the numeric Ticket ID from the ticket close log.", ephemeral=True)
-            return
-
-        path = get_ticket_log_path(interaction.guild.id, safe_ticket_id)
-        if not path.exists():
-            await interaction.response.send_message(f"No saved transcript found for Ticket ID `{safe_ticket_id}`.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            f"Saved transcript for Ticket ID `{safe_ticket_id}`:",
-            file=discord.File(path),
-            ephemeral=True,
-        )
 
     @app_commands.command(name="admin", description="Open the ticket admin control panel.")
     @app_commands.checks.has_permissions(administrator=True)
@@ -1810,7 +1780,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         embed = discord.Embed(title="Ticket Configuration", color=discord.Color.blurple())
         embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
-        embed.add_field(name="Log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
+        embed.add_field(name="Closed-ticket log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
         embed.add_field(name="Staff roles", value="\n".join(staff_mentions) if staff_mentions else "None", inline=False)
         embed.add_field(name="Default ping roles", value="\n".join(ping_mentions) if ping_mentions else "None", inline=False)
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
@@ -1849,7 +1819,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(
             name="How setup works",
             value=(
-                "`/ticket setup` sets where tickets are created and where logs go.\n"
+                "`/ticket setup` sets where tickets are created and where closed-ticket transcripts go.\n"
                 "`/ticket addstaff` controls who can see all tickets.\n"
                 "`/ticket addpingrole` controls who gets pinged by default.\n"
                 "`/ticket admin` opens the control panel for live edits."
@@ -1858,7 +1828,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
         embed.add_field(
             name="Inside the ticket",
-            value="Buttons included: **Claim**, **Ping Team**, **Set Ping Roles**, **Add User**, **Remove User**, **Add Role**, **Remove Role**, **Close**",
+            value="Buttons included: **Claim**, **Ping Team** with a 10-minute cooldown, **Set Ping Roles**, **Add Role**, **Remove Role**, **Close**",
             inline=False,
         )
         panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
@@ -1882,7 +1852,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 "A selected option could not be read correctly.\n\n"
                 "For `/ticket setup`:\n"
                 "- `category` must be a real Discord category\n"
-                "- `log_channel` must be a normal text channel"
+                "- `log_channel` must be a normal text channel for closed ticket logs/transcripts"
             )
         else:
             raise error
@@ -1900,6 +1870,7 @@ class TicketBot(commands.Bot):
 
         super().__init__(command_prefix="!", intents=intents)
         self.config_store = GuildConfigStore(CONFIG_PATH)
+        self.ticket_ping_cooldowns: dict[int, datetime] = {}
 
     async def setup_hook(self) -> None:
         self.add_view(TicketPanelView(self))
