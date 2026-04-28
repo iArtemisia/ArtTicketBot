@@ -19,6 +19,8 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
+
+# Optional global fallback GIF for the ticket panel.
 TICKET_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 
 TICKET_CONFIG: dict[str, str] = {
@@ -167,12 +169,6 @@ async def get_log_channel(bot: "TicketBot", guild: discord.Guild) -> Optional[di
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
-def get_panel_gif_url(bot: "TicketBot", guild: discord.Guild) -> str:
-    config = bot.config_store.get_guild(guild.id)
-    guild_value = str(config.get("panel_gif_url", "") or "").strip()
-    return guild_value or TICKET_PANEL_GIF_URL
-
-
 def get_staff_roles(bot: "TicketBot", guild: discord.Guild) -> list[discord.Role]:
     config = bot.config_store.get_guild(guild.id)
     roles: list[discord.Role] = []
@@ -261,31 +257,37 @@ async def build_transcript_file(channel: discord.TextChannel) -> discord.File:
     return discord.File(io.BytesIO(payload), filename=f"{channel.name}-transcript.txt")
 
 
-async def send_ephemeral(interaction: discord.Interaction, content: str) -> None:
-    if interaction.response.is_done():
-        await interaction.followup.send(content, ephemeral=True)
-    else:
-        await interaction.response.send_message(content, ephemeral=True)
+def get_panel_gif_url(bot: "TicketBot", guild_id: int) -> str:
+    config = bot.config_store.get_guild(guild_id)
+    return str(config.get("panel_gif_url", "") or TICKET_PANEL_GIF_URL).strip()
 
 
-async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interaction) -> None:
+async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interaction) -> Optional[discord.TextChannel]:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-        await send_ephemeral(interaction, "This can only be used inside a server.")
-        return
+        return None
 
     if not bot.config_store.is_ready(interaction.guild.id):
-        await send_ephemeral(interaction, "This server is not configured yet. An admin should run `/ticket setup` first.")
-        return
+        await interaction.response.send_message(
+            "This server is not configured yet. An admin should run `/ticket setup` first.",
+            ephemeral=True,
+        )
+        return None
 
     category = await get_ticket_category(bot, interaction.guild)
     if category is None:
-        await send_ephemeral(interaction, "The configured ticket category no longer exists. Run `/ticket setup` again.")
-        return
+        await interaction.response.send_message(
+            "The configured ticket category no longer exists. Run `/ticket setup` again.",
+            ephemeral=True,
+        )
+        return None
 
     existing = find_open_ticket_for_user(category, interaction.user.id)
     if existing:
-        await send_ephemeral(interaction, f"You already have an open ticket: {existing.mention}")
-        return
+        await interaction.response.send_message(
+            f"You already have an open ticket: {existing.mention}",
+            ephemeral=True,
+        )
+        return existing
 
     config = TICKET_CONFIG
     display_name = slugify(interaction.user.display_name)[:18]
@@ -329,7 +331,7 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
     channel = await guild.create_text_channel(
         name=channel_name,
         category=category,
-        topic=build_ticket_topic(owner_id=interaction.user.id, ticket_type="ticket"),
+        topic=build_ticket_topic(owner_id=interaction.user.id, ticket_type='ticket'),
         overwrites=overwrites,
         reason=f"Ticket opened by {interaction.user} ({interaction.user.id})",
     )
@@ -340,14 +342,13 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
     embed = discord.Embed(
         title=f"{config['emoji']} {config['label']}",
         description=(
-            "Thank you for opening a ticket.\n"
-            "A staff member will help you soon.\n\n"
-            "Use the buttons below to manage this ticket."
+            "Thank you for contacting support. A staff member will help you soon.\n\n"
+            "Use the buttons below to manage the ticket."
         ),
         color=discord.Color.blurple(),
         timestamp=now_utc(),
     )
-    embed.add_field(name="Opened by", value=interaction.user.mention, inline=False)
+    embed.add_field(name="User", value=interaction.user.mention, inline=False)
     embed.set_footer(text=f"User ID: {interaction.user.id}")
 
     await channel.send(
@@ -357,18 +358,18 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
         allowed_mentions=discord.AllowedMentions(users=True, roles=True),
     )
 
-    await send_ephemeral(interaction, f"Your ticket has been created: {channel.mention}")
-
     await log_event(
         bot,
         guild,
         title="Ticket Opened",
         description=(
             f"Channel: {channel.mention}\n"
-            f"User: {interaction.user.mention}"
+            f"User: {interaction.user.mention}\n"
+            f"Type: {config['label']}"
         ),
         color=discord.Color.green(),
     )
+    return channel
 
 
 class AddUserModal(discord.ui.Modal, title="Add User To Ticket"):
@@ -544,8 +545,14 @@ class TicketPanelView(discord.ui.View):
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        await create_ticket_channel(self.bot, interaction)
+        channel = await create_ticket_channel(self.bot, interaction)
+        if channel is None:
+            return
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Your ticket has been created: {channel.mention}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Your ticket has been created: {channel.mention}", ephemeral=True)
 
 
 class TicketChannelView(discord.ui.View):
@@ -628,36 +635,48 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
 
-        try:
-            real_category = category.resolve() or await category.fetch()
-        except discord.HTTPException:
-            real_category = None
+        real_category = category.resolve()
+        if real_category is None:
+            try:
+                real_category = await category.fetch()
+            except discord.HTTPException:
+                real_category = None
 
-        try:
-            real_log_channel = log_channel.resolve() or await log_channel.fetch()
-        except discord.HTTPException:
-            real_log_channel = None
+        real_log_channel = log_channel.resolve()
+        if real_log_channel is None:
+            try:
+                real_log_channel = await log_channel.fetch()
+            except discord.HTTPException:
+                real_log_channel = None
 
-        if not isinstance(real_category, discord.CategoryChannel):
-            picked_type = getattr(category, "type", "unknown")
+        category_type = str(getattr(category, "type", "")).lower()
+        log_type = str(getattr(log_channel, "type", "")).lower()
+
+        if category_type != "channeltype.category" and category_type != "category":
             await interaction.response.send_message(
                 (
                     "The **category** option must be a real Discord category.\n"
                     "This is where private ticket channels get created.\n\n"
-                    f"You picked: {category.mention} (`{picked_type}`)"
+                    f"You picked: {category.mention} (`{getattr(category, 'type', 'unknown')}`)"
                 ),
                 ephemeral=True,
             )
             return
 
-        if not isinstance(real_log_channel, discord.TextChannel):
-            picked_type = getattr(log_channel, "type", "unknown")
+        if log_type != "channeltype.text" and log_type != "text":
             await interaction.response.send_message(
                 (
                     "The **log_channel** option must be a normal text channel.\n"
                     "This is where ticket open/close logs and transcripts are sent.\n\n"
-                    f"You picked: {log_channel.mention} (`{picked_type}`)"
+                    f"You picked: {log_channel.mention} (`{getattr(log_channel, 'type', 'unknown')}`)"
                 ),
+                ephemeral=True,
+            )
+            return
+
+        if real_category is None or real_log_channel is None:
+            await interaction.response.send_message(
+                "I could not resolve the selected channels. Please try again.",
                 ephemeral=True,
             )
             return
@@ -673,9 +692,9 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         await interaction.response.send_message(
             (
                 "Saved ticket setup for this server.\n\n"
-                f"**Ticket category:** {real_category.name}\n"
+                f"**Ticket category:** {getattr(real_category, 'name', 'Unknown')}\n"
                 "Used for newly created private ticket channels.\n\n"
-                f"**Log channel:** {real_log_channel.mention}\n"
+                f"**Log channel:** {getattr(real_log_channel, 'mention', '#unknown')}\n"
                 "Used for ticket logs and transcripts.\n\n"
                 f"**Staff roles configured:** {len(config.get('staff_role_ids', []))}\n\n"
                 "Run `/ticket panel` in the channel where you want the open-ticket button posted."
@@ -683,28 +702,25 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="panelgif", description="Set or clear the panel GIF/image URL for this server.")
+    @app_commands.command(name="panelgif", description="Set or clear the GIF shown on the ticket panel.")
     @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(image_url="Direct GIF/image URL. Leave blank to clear.")
-    async def set_panel_gif(self, interaction: discord.Interaction, image_url: Optional[str] = None) -> None:
+    @app_commands.describe(image_url="Direct image or GIF URL. Leave blank to clear the server-specific panel GIF.")
+    async def panel_gif(self, interaction: discord.Interaction, image_url: Optional[str] = None) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
 
-        cleaned = (image_url or "").strip()
-        if cleaned:
-            self.bot.config_store.update_guild(interaction.guild.id, panel_gif_url=cleaned)
+        image_url = (image_url or "").strip()
+        if image_url:
+            self.bot.config_store.update_guild(interaction.guild.id, panel_gif_url=image_url)
             await interaction.response.send_message(
-                "Saved the panel GIF/image URL for this server.",
+                f"Saved the panel GIF/image URL for this server.\n{image_url}",
                 ephemeral=True,
             )
         else:
-            current = self.bot.config_store.get_guild(interaction.guild.id)
-            if "panel_gif_url" in current:
-                current.pop("panel_gif_url", None)
-                self.bot.config_store.set_guild(interaction.guild.id, current)
+            self.bot.config_store.update_guild(interaction.guild.id, panel_gif_url="")
             await interaction.response.send_message(
-                "Cleared the panel GIF/image URL for this server.",
+                "Cleared the server-specific panel GIF/image URL. The bot will now use the env fallback if one is set.",
                 ephemeral=True,
             )
 
@@ -750,15 +766,15 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             role = interaction.guild.get_role(role_id)
             role_mentions.append(role.mention if role else f"`{role_id}`")
 
-        panel_gif_url = get_panel_gif_url(self.bot, interaction.guild)
+        panel_gif = get_panel_gif_url(self.bot, interaction.guild.id)
 
         embed = discord.Embed(title="Ticket Configuration", color=discord.Color.blurple())
         embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
         embed.add_field(name="Log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
         embed.add_field(name="Staff roles", value="\n".join(role_mentions) if role_mentions else "None", inline=False)
         embed.add_field(
-            name="Panel GIF",
-            value=panel_gif_url if panel_gif_url else "Not set",
+            name="Panel GIF/Image",
+            value=panel_gif if panel_gif else "Not set",
             inline=False,
         )
         embed.add_field(
@@ -790,20 +806,32 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         embed = discord.Embed(
             title="Open a Ticket",
-            description="Press the button below to open a private ticket.",
+            description=(
+                "Press the button below to open a private ticket.\n\n"
+                "A private text channel will be created for you and the ticket staff."
+            ),
             color=discord.Color.blurple(),
             timestamp=now_utc(),
         )
         embed.add_field(
-            name="What happens",
-            value="A private text channel will be created for you and the ticket staff.",
+            name="How setup works",
+            value=(
+                "`/ticket setup` saves the category where ticket channels are created\n"
+                "and the log channel where transcripts/logs are sent."
+            ),
             inline=False,
         )
-        panel_gif_url = get_panel_gif_url(self.bot, interaction.guild)
+        embed.add_field(
+            name="Inside the ticket",
+            value="Buttons included: **Claim**, **Add User**, **Remove User**, **Close**",
+            inline=False,
+        )
+
+        panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
         if panel_gif_url:
             embed.set_image(url=panel_gif_url)
-        embed.set_footer(text="One open ticket per user.")
 
+        embed.set_footer(text="One open ticket per user.")
         await interaction.response.send_message(embed=embed, view=TicketPanelView(self.bot))
 
     @app_commands.command(name="ping", description="Check if the ticket bot is online.")
