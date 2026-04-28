@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -76,6 +77,21 @@ class GuildConfigStore:
         self.set_guild(guild_id, config)
         return config
 
+    def add_ping_role(self, guild_id: int, role_id: int) -> dict[str, Any]:
+        config = self.get_guild(guild_id)
+        ping_role_ids = config.get("ping_role_ids", [])
+        if role_id not in ping_role_ids:
+            ping_role_ids.append(role_id)
+        config["ping_role_ids"] = ping_role_ids
+        self.set_guild(guild_id, config)
+        return config
+
+    def remove_ping_role(self, guild_id: int, role_id: int) -> dict[str, Any]:
+        config = self.get_guild(guild_id)
+        config["ping_role_ids"] = [rid for rid in config.get("ping_role_ids", []) if rid != role_id]
+        self.set_guild(guild_id, config)
+        return config
+
     def is_ready(self, guild_id: int) -> bool:
         config = self.get_guild(guild_id)
         return bool(
@@ -107,12 +123,32 @@ def extract_id(raw_value: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-def build_ticket_topic(*, owner_id: int, ticket_type: str, status: str = "open", claimed_by: int = 0) -> str:
+def extract_ids(raw_value: str) -> list[int]:
+    seen: set[int] = set()
+    ids: list[int] = []
+    for match in re.findall(r"(\d{15,25})", raw_value):
+        value = int(match)
+        if value not in seen:
+            seen.add(value)
+            ids.append(value)
+    return ids
+
+
+def build_ticket_topic(
+    *,
+    owner_id: int,
+    ticket_type: str,
+    status: str = "open",
+    claimed_by: int = 0,
+    ping_role_ids: Optional[list[int]] = None,
+) -> str:
+    ping_part = ",".join(str(role_id) for role_id in (ping_role_ids or []))
     return (
         f"ticket_owner:{owner_id}|"
         f"ticket_type:{ticket_type}|"
         f"status:{status}|"
-        f"claimed_by:{claimed_by}"
+        f"claimed_by:{claimed_by}|"
+        f"ping_roles:{ping_part}"
     )
 
 
@@ -127,6 +163,17 @@ def parse_ticket_topic(topic: Optional[str]) -> dict[str, str]:
         key, value = part.split(":", 1)
         data[key] = value
     return data
+
+
+def get_ticket_ping_role_ids(channel: discord.TextChannel) -> list[int]:
+    data = parse_ticket_topic(channel.topic)
+    raw = data.get("ping_roles", "")
+    result: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            result.append(int(part))
+    return result
 
 
 def is_ticket_channel(channel: discord.abc.GuildChannel) -> bool:
@@ -179,6 +226,128 @@ def get_panel_gif_url(bot: "TicketBot", guild_id: int) -> str:
     return normalize_panel_image_url(DEFAULT_PANEL_GIF_URL)
 
 
+def get_guild_ping_roles(bot: "TicketBot", guild: discord.Guild) -> list[discord.Role]:
+    config = bot.config_store.get_guild(guild.id)
+    ping_role_ids = config.get("ping_role_ids", [])
+    roles: list[discord.Role] = []
+    for role_id in ping_role_ids:
+        role = guild.get_role(role_id)
+        if role is not None:
+            roles.append(role)
+    return roles
+
+
+def get_ticket_ping_roles(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Role]:
+    roles: list[discord.Role] = []
+    for role_id in get_ticket_ping_role_ids(channel):
+        role = guild.get_role(role_id)
+        if role is not None:
+            roles.append(role)
+    return roles
+
+
+def mention_roles(roles: list[discord.Role]) -> str:
+    return " ".join(f"<@&{role.id}>" for role in roles)
+
+
+def get_ticket_extra_roles(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Role]:
+    staff_ids = {role.id for role in get_staff_roles(bot, guild)}
+    roles: list[discord.Role] = []
+    for target, overwrite in channel.overwrites.items():
+        if not isinstance(target, discord.Role):
+            continue
+        if target.is_default():
+            continue
+        if target.id in staff_ids:
+            continue
+        if overwrite.view_channel is True:
+            roles.append(target)
+    return roles
+
+
+def get_ticket_extra_users(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Member]:
+    owner_id = get_ticket_owner_id(channel)
+    bot_member_id = guild.me.id if guild.me is not None else 0
+    users: list[discord.Member] = []
+    for target, overwrite in channel.overwrites.items():
+        if not isinstance(target, discord.Member):
+            continue
+        if target.id in {owner_id, bot_member_id}:
+            continue
+        if overwrite.view_channel is True:
+            users.append(target)
+    return users
+
+
+def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Optional[discord.abc.GuildChannel]) -> discord.Embed:
+    config = bot.config_store.get_guild(guild.id)
+    category = guild.get_channel(config.get("ticket_category_id", 0))
+    log_channel = guild.get_channel(config.get("log_channel_id", 0))
+    staff_roles = get_staff_roles(bot, guild)
+    ping_roles = get_guild_ping_roles(bot, guild)
+
+    embed = discord.Embed(
+        title="Ticket Admin Panel",
+        description=(
+            "Use the buttons below to edit ticket defaults and, when run inside a ticket channel, "
+            "that ticket's access and ping settings."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
+    embed.add_field(name="Log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
+    embed.add_field(
+        name="Default staff roles",
+        value="\n".join(role.mention for role in staff_roles) if staff_roles else "None",
+        inline=False,
+    )
+    embed.add_field(
+        name="Default ping roles",
+        value="\n".join(role.mention for role in ping_roles) if ping_roles else "None",
+        inline=False,
+    )
+
+    if isinstance(channel, discord.TextChannel) and is_ticket_channel(channel):
+        owner_id = get_ticket_owner_id(channel)
+        owner = guild.get_member(owner_id) if owner_id else None
+        ticket_ping_roles = get_ticket_ping_roles(bot, guild, channel)
+        extra_roles = get_ticket_extra_roles(bot, guild, channel)
+        extra_users = get_ticket_extra_users(bot, guild, channel)
+
+        embed.add_field(name="Current ticket", value=channel.mention, inline=False)
+        embed.add_field(name="Ticket owner", value=owner.mention if owner else f"`{owner_id}`", inline=False)
+        embed.add_field(
+            name="Ticket ping roles",
+            value="\n".join(role.mention for role in ticket_ping_roles) if ticket_ping_roles else "None",
+            inline=False,
+        )
+        embed.add_field(
+            name="Extra allowed roles",
+            value="\n".join(role.mention for role in extra_roles) if extra_roles else "None",
+            inline=False,
+        )
+        embed.add_field(
+            name="Extra allowed users",
+            value="\n".join(user.mention for user in extra_users) if extra_users else "None",
+            inline=False,
+        )
+        embed.add_field(
+            name="Ticket tools here",
+            value="Use the buttons below to add/remove users, add/remove roles, and set ticket ping roles for this specific ticket.",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Ticket-specific tools",
+            value="Run `/ticket admin` inside a ticket channel to edit that ticket's permissions and ping roles from this panel.",
+            inline=False,
+        )
+
+    embed.set_footer(text="This panel is admin-only and updates settings live.")
+    return embed
+
+
 async def fetch_member_safe(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
     member = guild.get_member(user_id)
     if member is not None:
@@ -229,13 +398,28 @@ def find_open_ticket_for_user(category: discord.CategoryChannel, user_id: int) -
     return None
 
 
-async def update_claimed_by(channel: discord.TextChannel, claimed_by: int) -> None:
+async def update_ticket_metadata(
+    channel: discord.TextChannel,
+    *,
+    status: Optional[str] = None,
+    claimed_by: Optional[int] = None,
+    ping_role_ids: Optional[list[int]] = None,
+) -> None:
     data = parse_ticket_topic(channel.topic)
     owner_id = int(data.get("ticket_owner", "0") or 0)
     ticket_type = data.get("ticket_type", "ticket")
-    status = data.get("status", "open")
+    current_status = status or data.get("status", "open")
+    current_claimed_by = claimed_by if claimed_by is not None else int(data.get("claimed_by", "0") or 0)
+    current_ping_role_ids = ping_role_ids if ping_role_ids is not None else get_ticket_ping_role_ids(channel)
+
     await channel.edit(
-        topic=build_ticket_topic(owner_id=owner_id, ticket_type=ticket_type, status=status, claimed_by=claimed_by)
+        topic=build_ticket_topic(
+            owner_id=owner_id,
+            ticket_type=ticket_type,
+            status=current_status,
+            claimed_by=current_claimed_by,
+            ping_role_ids=current_ping_role_ids,
+        )
     )
 
 
@@ -333,11 +517,14 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
             embed_links=True,
         )
 
+    ping_roles = get_guild_ping_roles(bot, guild)
+    ping_role_ids = [role.id for role in ping_roles]
+
     try:
         channel = await guild.create_text_channel(
             name=channel_name,
             category=category,
-            topic=build_ticket_topic(owner_id=interaction.user.id, ticket_type="ticket"),
+            topic=build_ticket_topic(owner_id=interaction.user.id, ticket_type="ticket", ping_role_ids=ping_role_ids),
             overwrites=overwrites,
             reason=f"Ticket opened by {interaction.user} ({interaction.user.id})",
         )
@@ -352,8 +539,9 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
     except discord.HTTPException:
         return None, "Discord refused the ticket channel create request. Try again in a moment."
 
-    mention_roles = " ".join(f"<@&{role.id}>" for role in get_staff_roles(bot, guild))
-    opening_ping = f"{interaction.user.mention} {mention_roles}".strip()
+    opening_mentions = " ".join(
+        part for part in [interaction.user.mention, mention_roles(ping_roles)] if part
+    ).strip()
 
     embed = discord.Embed(
         title=f"{TICKET_CONFIG['emoji']} {TICKET_CONFIG['label']}",
@@ -371,7 +559,7 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
 
     try:
         await channel.send(
-            content=opening_ping,
+            content=opening_mentions,
             embed=embed,
             view=TicketChannelView(bot),
             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
@@ -393,34 +581,6 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
         pass
 
     return channel, "created"
-
-
-class TicketOpenButton(discord.ui.Button):
-    def __init__(self, bot: "TicketBot"):
-        super().__init__(
-            label=TICKET_CONFIG["label"],
-            emoji=TICKET_CONFIG["emoji"],
-            style=discord.ButtonStyle.primary,
-            custom_id="ticket:open",
-        )
-        self.bot = bot
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        channel, status = await create_ticket_channel(self.bot, interaction)
-        if channel is None:
-            await interaction.followup.send(status, ephemeral=True)
-            return
-
-        if status == "created":
-            await interaction.followup.send(f"Your ticket has been created: {channel.mention}", ephemeral=True)
-        else:
-            await interaction.followup.send(status, ephemeral=True)
 
 
 class AddUserModal(discord.ui.Modal, title="Add User To Ticket"):
@@ -507,6 +667,238 @@ class RemoveUserModal(discord.ui.Modal, title="Remove User From Ticket"):
         await interaction.response.send_message(f"Removed {member.mention} from the ticket.", ephemeral=True)
 
 
+class AddRoleModal(discord.ui.Modal, title="Add Role To Ticket"):
+    role_input = discord.ui.TextInput(
+        label="Role ID or mention",
+        placeholder="Paste a role mention or role ID",
+        max_length=64,
+    )
+
+    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can add roles.", ephemeral=True)
+            return
+
+        role_id = extract_id(str(self.role_input.value))
+        if role_id is None:
+            await interaction.response.send_message("I could not find a role ID in that input.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(role_id)
+        if role is None:
+            await interaction.response.send_message("That role is not in this server.", ephemeral=True)
+            return
+
+        overwrite = self.channel.overwrites_for(role)
+        overwrite.view_channel = True
+        overwrite.send_messages = True
+        overwrite.read_message_history = True
+        overwrite.attach_files = True
+        overwrite.embed_links = True
+
+        await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role added to ticket by {interaction.user}")
+        await self.channel.send(f"🔓 {role.mention} can now see this ticket.")
+        await interaction.response.send_message(f"Added {role.mention} to this ticket.", ephemeral=True)
+
+
+class RemoveRoleModal(discord.ui.Modal, title="Remove Role From Ticket"):
+    role_input = discord.ui.TextInput(
+        label="Role ID or mention",
+        placeholder="Paste a role mention or role ID",
+        max_length=64,
+    )
+
+    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can remove roles.", ephemeral=True)
+            return
+
+        role_id = extract_id(str(self.role_input.value))
+        if role_id is None:
+            await interaction.response.send_message("I could not find a role ID in that input.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(role_id)
+        if role is None:
+            await interaction.response.send_message("That role is not in this server.", ephemeral=True)
+            return
+
+        if role.is_default():
+            await interaction.response.send_message("You can't edit @everyone here.", ephemeral=True)
+            return
+
+        overwrite = self.channel.overwrites_for(role)
+        overwrite.view_channel = False
+        overwrite.send_messages = False
+        overwrite.read_message_history = False
+        overwrite.attach_files = False
+        overwrite.embed_links = False
+
+        await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role removed from ticket by {interaction.user}")
+        await self.channel.send(f"🔒 {role.mention} can no longer see this ticket.")
+        await interaction.response.send_message(f"Removed {role.mention} from this ticket.", ephemeral=True)
+
+
+class SetPingRolesModal(discord.ui.Modal, title="Set Ticket Ping Roles"):
+    roles_input = discord.ui.TextInput(
+        label="Role mentions or IDs",
+        placeholder="Example: @Support @Moderators",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=400,
+    )
+
+    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can edit ping roles.", ephemeral=True)
+            return
+
+        role_ids = extract_ids(str(self.roles_input.value))
+        valid_roles: list[discord.Role] = []
+        for role_id in role_ids:
+            role = interaction.guild.get_role(role_id)
+            if role is not None and not role.is_default():
+                valid_roles.append(role)
+
+        await update_ticket_metadata(self.channel, ping_role_ids=[role.id for role in valid_roles])
+
+        if valid_roles:
+            mentions = ", ".join(role.mention for role in valid_roles)
+            await self.channel.send(f"📣 Ticket ping roles updated by {interaction.user.mention}: {mentions}")
+            await interaction.response.send_message(f"Updated ticket ping roles: {mentions}", ephemeral=True)
+        else:
+            await self.channel.send(f"📣 Ticket ping roles cleared by {interaction.user.mention}.")
+            await interaction.response.send_message("Cleared the ticket ping roles.", ephemeral=True)
+
+
+class AdminRoleConfigModal(discord.ui.Modal):
+    roles_input = discord.ui.TextInput(
+        label="Role mentions or IDs",
+        placeholder="Example: @Support @Moderators",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=400,
+    )
+
+    def __init__(self, bot: "TicketBot", action: str, target: str):
+        title_map = {
+            ("add", "staff"): "Add Default Staff Roles",
+            ("remove", "staff"): "Remove Default Staff Roles",
+            ("add", "ping"): "Add Default Ping Roles",
+            ("remove", "ping"): "Remove Default Ping Roles",
+        }
+        super().__init__(title=title_map[(action, target)], timeout=300)
+        self.bot = bot
+        self.action = action
+        self.target = target
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can edit default ticket roles.", ephemeral=True)
+            return
+
+        role_ids = extract_ids(str(self.roles_input.value))
+        roles: list[discord.Role] = []
+        for role_id in role_ids:
+            role = interaction.guild.get_role(role_id)
+            if role is not None and not role.is_default():
+                roles.append(role)
+
+        if not roles:
+            await interaction.response.send_message("I could not find any valid roles in that input.", ephemeral=True)
+            return
+
+        if self.target == "staff":
+            if self.action == "add":
+                for role in roles:
+                    self.bot.config_store.add_staff_role(interaction.guild.id, role.id)
+                msg = f"Added default staff roles: {', '.join(role.mention for role in roles)}"
+            else:
+                for role in roles:
+                    self.bot.config_store.remove_staff_role(interaction.guild.id, role.id)
+                msg = f"Removed default staff roles: {', '.join(role.mention for role in roles)}"
+        else:
+            if self.action == "add":
+                for role in roles:
+                    self.bot.config_store.add_ping_role(interaction.guild.id, role.id)
+                msg = f"Added default ping roles: {', '.join(role.mention for role in roles)}"
+            else:
+                for role in roles:
+                    self.bot.config_store.remove_ping_role(interaction.guild.id, role.id)
+                msg = f"Removed default ping roles: {', '.join(role.mention for role in roles)}"
+
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+class AdminPanelGifModal(discord.ui.Modal, title="Set Panel GIF or Image"):
+    image_input = discord.ui.TextInput(
+        label="Image/GIF URL",
+        placeholder="Direct image URL or Imgur page URL. Leave blank to clear.",
+        required=False,
+        max_length=400,
+    )
+
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(timeout=300)
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can edit the panel image.", ephemeral=True)
+            return
+
+        cleaned = normalize_panel_image_url(str(self.image_input.value))
+        current = self.bot.config_store.get_guild(interaction.guild.id)
+        self.bot.config_store.update_guild(
+            interaction.guild.id,
+            ticket_category_id=current.get("ticket_category_id"),
+            log_channel_id=current.get("log_channel_id"),
+            staff_role_ids=current.get("staff_role_ids", []),
+            ping_role_ids=current.get("ping_role_ids", []),
+            panel_gif_url=cleaned,
+        )
+
+        if cleaned:
+            await interaction.response.send_message(f"Saved the panel image URL:\n{cleaned}", ephemeral=True)
+        else:
+            await interaction.response.send_message("Cleared the saved panel image URL.", ephemeral=True)
+
+
 class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
     reason = discord.ui.TextInput(
         label="Reason",
@@ -542,11 +934,17 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         await interaction.response.send_message("Closing the ticket and saving transcript...", ephemeral=True)
 
         topic_data = parse_ticket_topic(self.channel.topic)
-        ticket_type = topic_data.get("ticket_type", "ticket")
         claimed_by = int(topic_data.get("claimed_by", "0") or 0)
+        ping_role_ids = get_ticket_ping_role_ids(self.channel)
 
         await self.channel.edit(
-            topic=build_ticket_topic(owner_id=owner_id, ticket_type=ticket_type, status="closed", claimed_by=claimed_by)
+            topic=build_ticket_topic(
+                owner_id=owner_id,
+                ticket_type=topic_data.get("ticket_type", "ticket"),
+                status="closed",
+                claimed_by=claimed_by,
+                ping_role_ids=ping_role_ids,
+            )
         )
 
         transcript = await build_transcript_file(self.channel)
@@ -570,6 +968,34 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         await self.channel.delete(reason=f"Ticket closed by {interaction.user} ({interaction.user.id})")
 
 
+class TicketOpenButton(discord.ui.Button):
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(
+            label=TICKET_CONFIG["label"],
+            emoji=TICKET_CONFIG["emoji"],
+            style=discord.ButtonStyle.primary,
+            custom_id="ticket:open",
+        )
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        channel, status = await create_ticket_channel(self.bot, interaction)
+        if channel is None:
+            await interaction.followup.send(status, ephemeral=True)
+            return
+
+        if status == "created":
+            await interaction.followup.send(f"Your ticket has been created: {channel.mention}", ephemeral=True)
+        else:
+            await interaction.followup.send(status, ephemeral=True)
+
+
 class TicketPanelView(discord.ui.View):
     def __init__(self, bot: "TicketBot"):
         super().__init__(timeout=None)
@@ -581,7 +1007,7 @@ class TicketChannelView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="ticket:claim")
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="ticket:claim", row=0)
     async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
@@ -602,11 +1028,49 @@ class TicketChannelView(discord.ui.View):
             await interaction.response.send_message("You already claimed this ticket.", ephemeral=True)
             return
 
-        await update_claimed_by(channel, interaction.user.id)
+        await update_ticket_metadata(channel, claimed_by=interaction.user.id)
         await channel.send(f"📌 Ticket claimed by {interaction.user.mention}.")
         await interaction.response.send_message("You claimed this ticket.", ephemeral=True)
 
-    @discord.ui.button(label="Add User", style=discord.ButtonStyle.secondary, custom_id="ticket:add_user")
+    @discord.ui.button(label="Ping Team", style=discord.ButtonStyle.secondary, custom_id="ticket:ping_team", row=0)
+    async def ping_team_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can ping the team here.", ephemeral=True)
+            return
+
+        ping_roles = get_ticket_ping_roles(self.bot, interaction.guild, channel)
+        if not ping_roles:
+            await interaction.response.send_message(
+                "No ticket ping roles are set. Use **Set Ping Roles** or `/ticket addpingrole`.",
+                ephemeral=True,
+            )
+            return
+
+        await channel.send(
+            f"📣 {interaction.user.mention} pinged: {mention_roles(ping_roles)}",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+        )
+        await interaction.response.send_message("Pinged the configured ticket roles.", ephemeral=True)
+
+    @discord.ui.button(label="Set Ping Roles", style=discord.ButtonStyle.secondary, custom_id="ticket:set_ping_roles", row=0)
+    async def set_ping_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(SetPingRolesModal(self.bot, channel))
+
+    @discord.ui.button(label="Add User", style=discord.ButtonStyle.secondary, custom_id="ticket:add_user", row=1)
     async def add_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
@@ -615,7 +1079,7 @@ class TicketChannelView(discord.ui.View):
 
         await interaction.response.send_modal(AddUserModal(self.bot, channel))
 
-    @discord.ui.button(label="Remove User", style=discord.ButtonStyle.secondary, custom_id="ticket:remove_user")
+    @discord.ui.button(label="Remove User", style=discord.ButtonStyle.secondary, custom_id="ticket:remove_user", row=1)
     async def remove_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
@@ -624,7 +1088,25 @@ class TicketChannelView(discord.ui.View):
 
         await interaction.response.send_modal(RemoveUserModal(self.bot, channel))
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="ticket:close")
+    @discord.ui.button(label="Add Role", style=discord.ButtonStyle.secondary, custom_id="ticket:add_role", row=2)
+    async def add_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(AddRoleModal(self.bot, channel))
+
+    @discord.ui.button(label="Remove Role", style=discord.ButtonStyle.secondary, custom_id="ticket:remove_role", row=2)
+    async def remove_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(RemoveRoleModal(self.bot, channel))
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="ticket:close", row=3)
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
@@ -632,6 +1114,87 @@ class TicketChannelView(discord.ui.View):
             return
 
         await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
+
+
+class TicketAdminPanelView(discord.ui.View):
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(timeout=600)
+        self.bot = bot
+
+    def _get_ticket_channel(self, interaction: discord.Interaction) -> Optional[discord.TextChannel]:
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel) and is_ticket_channel(channel):
+            return channel
+        return None
+
+    @discord.ui.button(label="Add Staff", style=discord.ButtonStyle.secondary, row=0)
+    async def add_staff_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "add", "staff"))
+
+    @discord.ui.button(label="Remove Staff", style=discord.ButtonStyle.secondary, row=0)
+    async def remove_staff_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "remove", "staff"))
+
+    @discord.ui.button(label="Add Ping Role", style=discord.ButtonStyle.secondary, row=0)
+    async def add_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "add", "ping"))
+
+    @discord.ui.button(label="Remove Ping Role", style=discord.ButtonStyle.secondary, row=0)
+    async def remove_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "remove", "ping"))
+
+    @discord.ui.button(label="Set Panel GIF", style=discord.ButtonStyle.secondary, row=1)
+    async def set_panel_gif_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AdminPanelGifModal(self.bot))
+
+    @discord.ui.button(label="Add User", style=discord.ButtonStyle.secondary, row=1)
+    async def add_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = self._get_ticket_channel(interaction)
+        if channel is None:
+            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to add users there.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddUserModal(self.bot, channel))
+
+    @discord.ui.button(label="Remove User", style=discord.ButtonStyle.secondary, row=1)
+    async def remove_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = self._get_ticket_channel(interaction)
+        if channel is None:
+            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to remove users there.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RemoveUserModal(self.bot, channel))
+
+    @discord.ui.button(label="Add Role", style=discord.ButtonStyle.secondary, row=2)
+    async def add_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = self._get_ticket_channel(interaction)
+        if channel is None:
+            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to add roles there.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddRoleModal(self.bot, channel))
+
+    @discord.ui.button(label="Remove Role", style=discord.ButtonStyle.secondary, row=2)
+    async def remove_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = self._get_ticket_channel(interaction)
+        if channel is None:
+            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to remove roles there.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RemoveRoleModal(self.bot, channel))
+
+    @discord.ui.button(label="Set Ticket Ping", style=discord.ButtonStyle.secondary, row=2)
+    async def set_ticket_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = self._get_ticket_channel(interaction)
+        if channel is None:
+            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to edit that ticket's ping roles.", ephemeral=True)
+            return
+        await interaction.response.send_modal(SetPingRolesModal(self.bot, channel))
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=3)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 @app_commands.guild_only()
@@ -696,6 +1259,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ticket_category_id=real_category.id,
             log_channel_id=real_log_channel.id,
             staff_role_ids=current.get("staff_role_ids", []),
+            ping_role_ids=current.get("ping_role_ids", []),
             panel_gif_url=current.get("panel_gif_url", ""),
         )
 
@@ -738,6 +1302,32 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
+    @app_commands.command(name="addpingrole", description="Add a default ping role for new tickets.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def add_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        config = self.bot.config_store.add_ping_role(interaction.guild.id, role.id)
+        await interaction.response.send_message(
+            f"Added {role.mention} to the default ticket ping list. Total ping roles: {len(config.get('ping_role_ids', []))}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="removepingrole", description="Remove a default ping role for new tickets.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def remove_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        config = self.bot.config_store.remove_ping_role(interaction.guild.id, role.id)
+        await interaction.response.send_message(
+            f"Removed {role.mention} from the default ticket ping list. Total ping roles: {len(config.get('ping_role_ids', []))}",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="panelgif", description="Set or clear the GIF/image shown on the ticket panel.")
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
@@ -763,6 +1353,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ticket_category_id=current.get("ticket_category_id"),
             log_channel_id=current.get("log_channel_id"),
             staff_role_ids=current.get("staff_role_ids", []),
+            ping_role_ids=current.get("ping_role_ids", []),
             panel_gif_url=cleaned,
         )
 
@@ -777,6 +1368,17 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 ephemeral=True,
             )
 
+
+    @app_commands.command(name="admin", description="Open the ticket admin control panel.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ticket_admin(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
+        await interaction.response.send_message(embed=embed, view=TicketAdminPanelView(self.bot), ephemeral=True)
+
     @app_commands.command(name="config", description="Show the ticket configuration for this server.")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def show_config(self, interaction: discord.Interaction) -> None:
@@ -787,22 +1389,28 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         config = self.bot.config_store.get_guild(interaction.guild.id)
         category = interaction.guild.get_channel(config.get("ticket_category_id", 0))
         log_channel = interaction.guild.get_channel(config.get("log_channel_id", 0))
-        role_mentions = []
+        staff_mentions: list[str] = []
+        ping_mentions: list[str] = []
 
         for role_id in config.get("staff_role_ids", []):
             role = interaction.guild.get_role(role_id)
-            role_mentions.append(role.mention if role else f"`{role_id}`")
+            staff_mentions.append(role.mention if role else f"`{role_id}`")
+
+        for role_id in config.get("ping_role_ids", []):
+            role = interaction.guild.get_role(role_id)
+            ping_mentions.append(role.mention if role else f"`{role_id}`")
 
         panel_url = get_panel_gif_url(self.bot, interaction.guild.id) or "Not set"
 
         embed = discord.Embed(title="Ticket Configuration", color=discord.Color.blurple())
         embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
         embed.add_field(name="Log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
-        embed.add_field(name="Staff roles", value="\n".join(role_mentions) if role_mentions else "None", inline=False)
+        embed.add_field(name="Staff roles", value="\n".join(staff_mentions) if staff_mentions else "None", inline=False)
+        embed.add_field(name="Default ping roles", value="\n".join(ping_mentions) if ping_mentions else "None", inline=False)
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
-            name="Where does the panel go?",
-            value="Run `/ticket panel` in the text channel where you want the embed posted.",
+            name="In-ticket controls",
+            value="Use `/ticket admin` or the ticket buttons to claim, ping, add/remove users, and add/remove roles for that specific ticket.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
@@ -832,6 +1440,21 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             color=discord.Color.blurple(),
             timestamp=now_utc(),
         )
+        embed.add_field(
+            name="How setup works",
+            value=(
+                "`/ticket setup` sets where tickets are created and where logs go.\n"
+                "`/ticket addstaff` controls who can see all tickets.\n"
+                "`/ticket addpingrole` controls who gets pinged by default.\n"
+                "`/ticket admin` opens the control panel for live edits."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Inside the ticket",
+            value="Buttons included: **Claim**, **Ping Team**, **Set Ping Roles**, **Add User**, **Remove User**, **Add Role**, **Remove Role**, **Close**",
+            inline=False,
+        )
         panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
         if panel_gif_url:
             embed.set_image(url=panel_gif_url)
@@ -853,17 +1476,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 "A selected option could not be read correctly.\n\n"
                 "For `/ticket setup`:\n"
                 "- `category` must be a real Discord category\n"
-                "- `log_channel` must be a normal text channel\n\n"
-                "Then use `/ticket panel` in the channel where you want the ticket embed posted."
-            )
-        elif isinstance(error, app_commands.CommandInvokeError) and isinstance(error.original, discord.Forbidden):
-            message = (
-                "The bot was blocked by channel or category permissions.\n\n"
-                "Make sure it can:\n"
-                "• View Channel\n"
-                "• Send Messages\n"
-                "• Embed Links\n"
-                "• Manage Channels"
+                "- `log_channel` must be a normal text channel"
             )
         else:
             raise error
