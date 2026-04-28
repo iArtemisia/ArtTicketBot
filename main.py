@@ -689,35 +689,28 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
 
-        try:
-            real_category = category.resolve() or await category.fetch()
-        except discord.HTTPException:
-            real_category = None
+        category_type = str(getattr(category, "type", "")).lower()
+        log_channel_type = str(getattr(log_channel, "type", "")).lower()
 
-        try:
-            real_log_channel = log_channel.resolve() or await log_channel.fetch()
-        except discord.HTTPException:
-            real_log_channel = None
-
-        if not isinstance(real_category, discord.CategoryChannel):
-            picked_type = getattr(category, "type", "unknown")
+        if category_type != "category":
             await interaction.response.send_message(
                 (
                     "The **category** option must be a real Discord category.\n"
                     "This is where private ticket channels get created.\n\n"
-                    f"You picked: {category.mention} (`{picked_type}`)"
+                    f"You picked: {category.mention} (`{category_type or 'unknown'}`)"
                 ),
                 ephemeral=True,
             )
             return
 
-        if not isinstance(real_log_channel, discord.TextChannel):
-            picked_type = getattr(log_channel, "type", "unknown")
+        valid_log_types = {"text", "news", "announcement"}
+
+        if log_channel_type not in valid_log_types:
             await interaction.response.send_message(
                 (
                     "The **log_channel** option must be a normal text channel.\n"
                     "This is where ticket open/close logs and transcripts are sent.\n\n"
-                    f"You picked: {log_channel.mention} (`{picked_type}`)"
+                    f"You picked: {log_channel.mention} (`{log_channel_type or 'unknown'}`)"
                 ),
                 ephemeral=True,
             )
@@ -726,17 +719,19 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         current = self.bot.config_store.get_guild(interaction.guild.id)
         config = self.bot.config_store.update_guild(
             interaction.guild.id,
-            ticket_category_id=real_category.id,
-            log_channel_id=real_log_channel.id,
+            ticket_category_id=category.id,
+            log_channel_id=log_channel.id,
             staff_role_ids=current.get("staff_role_ids", []),
         )
+
+        category_name = getattr(category, "name", f"ID {category.id}")
 
         await interaction.response.send_message(
             (
                 "Saved ticket setup for this server.\n\n"
-                f"**Ticket category:** {real_category.name}\n"
+                f"**Ticket category:** {category_name}\n"
                 "Used for newly created private ticket channels.\n\n"
-                f"**Log channel:** {real_log_channel.mention}\n"
+                f"**Log channel:** {log_channel.mention}\n"
                 "Used for ticket logs and transcripts.\n\n"
                 f"**Staff roles configured:** {len(config.get('staff_role_ids', []))}\n\n"
                 "Run `/ticket panel` in the channel where you want the ticket embed posted."
@@ -787,14 +782,9 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             role_mentions.append(role.mention if role else f"`{role_id}`")
 
         embed = discord.Embed(title="Ticket Configuration", color=discord.Color.blurple())
-        embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
+        embed.add_field(name="Category", value=category.name if category else "Not set", inline=False)
         embed.add_field(name="Log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
         embed.add_field(name="Staff roles", value="\n".join(role_mentions) if role_mentions else "None", inline=False)
-        embed.add_field(
-            name="Where does the panel go?",
-            value="Run `/ticket panel` in the text channel where you want the embed posted.",
-            inline=False,
-        )
         embed.add_field(
             name="Ready",
             value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No",
@@ -812,7 +802,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         if not self.bot.config_store.is_ready(interaction.guild.id):
             await interaction.response.send_message(
-                "This server is not configured yet. Run `/ticket setup` and `/ticket addstaff` first.",
+                "This server is not configured yet. Run /ticket setup and /ticket addstaff first.",
                 ephemeral=True,
             )
             return
@@ -827,16 +817,6 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             timestamp=now_utc(),
         )
         embed.add_field(
-            name="Ticket category",
-            value="Configured with `/ticket setup`. Private ticket channels are created there.",
-            inline=False,
-        )
-        embed.add_field(
-            name="Where does this panel get posted?",
-            value="Right here in the channel where `/ticket panel` is used.",
-            inline=False,
-        )
-        embed.add_field(
             name="Ticket Types",
             value="\n".join(
                 f"{config['emoji']} **{config['label']}** — {config['description']}"
@@ -849,11 +829,21 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             value="Buttons included: **Claim**, **Add User**, **Remove User**, **Close**",
             inline=False,
         )
+        embed.add_field(
+            name="How setup works",
+            value=(
+                "`/ticket setup` saves:\n"
+                "• the category where ticket channels are created\n"
+                "• the log channel where transcripts/logs are sent\n\n"
+                "`/ticket panel` posts the ticket embed in the channel you run it in"
+            ),
+            inline=False,
+        )
         embed.set_footer(text="One open ticket per user.")
 
         assert interaction.channel is not None
         await interaction.channel.send(embed=embed, view=TicketPanelView(self.bot))
-        await interaction.response.send_message("Ticket panel posted in this channel.", ephemeral=True)
+        await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
     @app_commands.command(name="ping", description="Check if the ticket bot is online.")
     async def ticket_ping(self, interaction: discord.Interaction) -> None:
@@ -872,7 +862,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 "A selected option could not be read correctly.\n\n"
                 "For `/ticket setup`:\n"
                 "- `category` must be a real Discord category\n"
-                "- `log_channel` must be a normal text channel\n\n"
+                "- `log_channel` must be a normal text/news channel\n\n"
                 "Then use `/ticket panel` in the channel where you want the ticket embed posted."
             )
         else:
