@@ -22,6 +22,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
+TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
 
 TICKET_CONFIG: dict[str, str] = {
     "label": "Open Ticket",
@@ -279,6 +280,116 @@ def get_ticket_extra_users(bot: "TicketBot", guild: discord.Guild, channel: disc
     return users
 
 
+def get_config_role_ids(bot: "TicketBot", guild_id: int, target: str) -> list[int]:
+    config = bot.config_store.get_guild(guild_id)
+    key = "staff_role_ids" if target == "staff" else "ping_role_ids"
+    return [int(role_id) for role_id in config.get(key, []) if str(role_id).isdigit()]
+
+
+def get_config_roles(bot: "TicketBot", guild: discord.Guild, target: str) -> list[discord.Role]:
+    roles: list[discord.Role] = []
+    for role_id in get_config_role_ids(bot, guild.id, target):
+        role = guild.get_role(role_id)
+        if role is not None and not role.is_default():
+            roles.append(role)
+    return roles
+
+
+def get_selectable_roles(bot: "TicketBot", guild: discord.Guild, target: str, action: str) -> list[discord.Role]:
+    configured = set(get_config_role_ids(bot, guild.id, target))
+    roles = [role for role in guild.roles if not role.is_default() and not role.managed]
+    roles.sort(key=lambda role: role.position, reverse=True)
+
+    if action == "add":
+        roles = [role for role in roles if role.id not in configured]
+    else:
+        roles = [role for role in roles if role.id in configured]
+
+    return roles[:25]
+
+
+def format_role_list(roles: list[discord.Role]) -> str:
+    return "\n".join(role.mention for role in roles) if roles else "None"
+
+
+def build_role_config_embed(bot: "TicketBot", guild: discord.Guild, target: str, action: str) -> discord.Embed:
+    target_label = "staff" if target == "staff" else "ping"
+    action_label = "Add" if action == "add" else "Remove"
+    configured_roles = get_config_roles(bot, guild, target)
+    selectable_roles = get_selectable_roles(bot, guild, target, action)
+
+    embed = discord.Embed(
+        title=f"{action_label} Ticket {target_label.title()} Role",
+        description=(
+            "Pick a role from the dropdown below.\n\n"
+            "Already configured roles are shown here so you do not need to paste role IDs."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=now_utc(),
+    )
+    embed.add_field(name=f"Current {target_label} roles", value=format_role_list(configured_roles), inline=False)
+    helper = "Dropdown shows roles that are not already configured." if action == "add" else "Dropdown shows roles that are currently configured."
+    embed.add_field(name="Dropdown status", value=f"{helper}\nAvailable choices shown: {len(selectable_roles)} / 25 max.", inline=False)
+    embed.set_footer(text="Discord dropdowns can show up to 25 roles at a time.")
+    return embed
+
+
+def clean_tag_name(name: str) -> str:
+    value = name.lower().strip()
+    value = re.sub(r"[^a-z0-9_-]+", "-", value)
+    return value.strip("-")[:40]
+
+
+def get_tags(bot: "TicketBot", guild_id: int) -> dict[str, str]:
+    config = bot.config_store.get_guild(guild_id)
+    raw = config.get("tags", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def set_tag(bot: "TicketBot", guild_id: int, name: str, response: str) -> dict[str, str]:
+    tags = dict(get_tags(bot, guild_id))
+    tags[name] = response
+    bot.config_store.update_guild(guild_id, tags=tags)
+    return tags
+
+
+def remove_tag(bot: "TicketBot", guild_id: int, name: str) -> bool:
+    tags = dict(get_tags(bot, guild_id))
+    existed = name in tags
+    tags.pop(name, None)
+    bot.config_store.update_guild(guild_id, tags=tags)
+    return existed
+
+
+def get_notes_thread_id(bot: "TicketBot", guild_id: int, ticket_channel_id: int) -> Optional[int]:
+    config = bot.config_store.get_guild(guild_id)
+    mapping = config.get("notes_thread_ids", {})
+    if not isinstance(mapping, dict):
+        return None
+    value = mapping.get(str(ticket_channel_id))
+    return int(value) if str(value).isdigit() else None
+
+
+def set_notes_thread_id(bot: "TicketBot", guild_id: int, ticket_channel_id: int, thread_id: int) -> None:
+    config = bot.config_store.get_guild(guild_id)
+    mapping = config.get("notes_thread_ids", {})
+    if not isinstance(mapping, dict):
+        mapping = {}
+    mapping[str(ticket_channel_id)] = int(thread_id)
+    bot.config_store.update_guild(guild_id, notes_thread_ids=mapping)
+
+
+def get_ticket_log_id(channel: discord.TextChannel) -> str:
+    return str(channel.id)
+
+
+def get_ticket_log_path(guild_id: int, ticket_id: str) -> Path:
+    safe_ticket_id = re.sub(r"[^0-9]", "", str(ticket_id)) or "unknown"
+    folder = TICKET_LOG_DIR / str(guild_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{safe_ticket_id}.txt"
+
+
 def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Optional[discord.abc.GuildChannel]) -> discord.Embed:
     config = bot.config_store.get_guild(guild.id)
     category = guild.get_channel(config.get("ticket_category_id", 0))
@@ -289,8 +400,8 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
     embed = discord.Embed(
         title="Ticket Admin Panel",
         description=(
-            "Use the buttons below to edit ticket defaults and, when run inside a ticket channel, "
-            "that ticket's access and ping settings."
+            "Use the buttons below to edit default staff/ping roles with dropdowns. "
+            "When opened inside a ticket, the panel can also edit that ticket's role access and ping settings."
         ),
         color=discord.Color.blurple(),
         timestamp=now_utc(),
@@ -334,13 +445,13 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
         )
         embed.add_field(
             name="Ticket tools here",
-            value="Use the buttons below to add/remove users, add/remove roles, and set ticket ping roles for this specific ticket.",
+            value="Use the buttons below to add/remove roles and set ticket ping roles for this specific ticket. User add/remove stays on the ticket channel buttons.",
             inline=False,
         )
     else:
         embed.add_field(
             name="Ticket-specific tools",
-            value="Run `/ticket admin` inside a ticket channel to edit that ticket's permissions and ping roles from this panel.",
+            value="Run `/ticket admin` inside a ticket channel to edit that ticket's role permissions and ping roles from this panel.",
             inline=False,
         )
 
@@ -440,29 +551,126 @@ async def log_event(
     await log_channel.send(embed=embed, file=file)
 
 
-async def build_transcript_file(channel: discord.TextChannel) -> discord.File:
+async def append_history_lines(lines: list[str], source, *, label: str) -> None:
+    lines.append(f"--- {label} ---")
+
+    try:
+        async for message in source.history(limit=None, oldest_first=True):
+            created = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            author = f"{message.author} ({message.author.id})"
+            content = message.content or ""
+            lines.append(f"[{created}] {author}: {content}")
+
+            if message.attachments:
+                for attachment in message.attachments:
+                    lines.append(f"    attachment: {attachment.url}")
+
+            if message.embeds:
+                lines.append(f"    embeds: {len(message.embeds)}")
+    except discord.HTTPException:
+        lines.append("Unable to read this section from Discord.")
+
+
+def transcript_file_from_text(text_value: str, filename: str) -> discord.File:
+    payload = text_value.encode("utf-8")
+    return discord.File(io.BytesIO(payload), filename=filename)
+
+
+async def build_ticket_and_notes_transcript_text(
+    channel: discord.TextChannel,
+    notes_thread: Optional[discord.Thread] = None,
+) -> str:
     lines: list[str] = []
     lines.append(f"Transcript for #{channel.name}")
+    lines.append(f"Ticket ID: {get_ticket_log_id(channel)}")
     lines.append(f"Channel ID: {channel.id}")
     lines.append(f"Generated: {now_utc().isoformat()}")
-    lines.append("-" * 60)
+    lines.append("=" * 70)
+    lines.append("")
 
-    async for message in channel.history(limit=None, oldest_first=True):
-        created = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-        author = f"{message.author} ({message.author.id})"
-        content = message.content or ""
-        lines.append(f"[{created}] {author}: {content}")
+    await append_history_lines(lines, channel, label="TICKET CONVERSATION")
 
-        if message.attachments:
-            for attachment in message.attachments:
-                lines.append(f"    attachment: {attachment.url}")
+    lines.append("")
+    lines.append("=" * 70)
+    lines.append("STAFF NOTES")
+    lines.append("=" * 70)
 
-        if message.embeds:
-            lines.append(f"    embeds: {len(message.embeds)}")
+    if notes_thread is not None:
+        lines.append(f"Notes Thread: #{notes_thread.name} ({notes_thread.id})")
+        await append_history_lines(lines, notes_thread, label="STAFF NOTES THREAD")
+    else:
+        lines.append("No staff notes thread was linked to this ticket.")
 
-    payload = "\n".join(lines).encode("utf-8")
-    return discord.File(io.BytesIO(payload), filename=f"{channel.name}-transcript.txt")
+    return "\n".join(lines)
 
+
+async def build_transcript_file(channel: discord.TextChannel) -> discord.File:
+    text_value = await build_ticket_and_notes_transcript_text(channel, None)
+    return transcript_file_from_text(text_value, f"{channel.name}-transcript.txt")
+
+
+def save_ticket_log_text(guild_id: int, ticket_id: str, transcript_text: str) -> Path:
+    path = get_ticket_log_path(guild_id, ticket_id)
+    path.write_text(transcript_text, encoding="utf-8")
+    return path
+
+
+async def get_notes_thread(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+) -> Optional[discord.Thread]:
+    thread_id = get_notes_thread_id(bot, guild.id, channel.id)
+    if not thread_id:
+        return None
+
+    thread = guild.get_thread(thread_id)
+    if thread is not None:
+        return thread
+
+    try:
+        fetched = await bot.fetch_channel(thread_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+    return fetched if isinstance(fetched, discord.Thread) else None
+
+
+async def create_or_get_notes_thread(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+    creator: discord.Member,
+) -> tuple[Optional[discord.Thread], str]:
+    existing = await get_notes_thread(bot, guild, channel)
+    if existing is not None:
+        return existing, "existing"
+
+    try:
+        thread = await channel.create_thread(
+            name=f"staff-notes-{channel.name}"[:100],
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+            reason=f"Staff notes created by {creator} ({creator.id})",
+        )
+    except TypeError:
+        thread = await channel.create_thread(
+            name=f"staff-notes-{channel.name}"[:100],
+            type=discord.ChannelType.private_thread,
+            reason=f"Staff notes created by {creator} ({creator.id})",
+        )
+    except discord.Forbidden:
+        return None, "I could not create a private notes thread. Give me Manage Threads permission."
+    except discord.HTTPException:
+        return None, "Discord refused the notes thread request. This server may not support private threads here."
+
+    set_notes_thread_id(bot, guild.id, channel.id, thread.id)
+
+    await thread.send(
+        "📝 **Staff Notes**\n"
+        "Use this private thread for internal discussion. These notes are appended to the ticket transcript when the ticket closes."
+    )
+    return thread, "created"
 
 async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interaction) -> tuple[Optional[discord.TextChannel], str]:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -947,17 +1155,27 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             )
         )
 
-        transcript = await build_transcript_file(self.channel)
+        notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
+        transcript_text = await build_ticket_and_notes_transcript_text(self.channel, notes_thread)
+        ticket_log_id = get_ticket_log_id(self.channel)
+        save_ticket_log_text(interaction.guild.id, ticket_log_id, transcript_text)
+        transcript = transcript_file_from_text(
+            transcript_text,
+            f"ticket-{ticket_log_id}-{self.channel.name}-transcript.txt",
+        )
 
+        notes_line = f"\nNotes thread: {notes_thread.mention}" if notes_thread else ""
         await log_event(
             self.bot,
             interaction.guild,
             title="Ticket Closed",
             description=(
+                f"Ticket ID: `{ticket_log_id}`\n"
                 f"Channel: #{self.channel.name}\n"
                 f"Closed by: {interaction.user.mention}\n"
                 f"Owner ID: {owner_id}\n"
                 f"Reason: {truncate(reason_text, 1000)}"
+                f"{notes_line}"
             ),
             color=discord.Color.red(),
             file=transcript,
@@ -1116,6 +1334,100 @@ class TicketChannelView(discord.ui.View):
         await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
 
 
+class ConfigRoleSelect(discord.ui.Select):
+    def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str):
+        self.bot = bot
+        self.target = target
+        self.action = action
+        self.guild_id = guild.id
+
+        roles = get_selectable_roles(bot, guild, target, action)
+        options: list[discord.SelectOption] = []
+        for role in roles:
+            label = role.name[:100]
+            description = f"ID: {role.id}"
+            options.append(discord.SelectOption(label=label, value=str(role.id), description=description))
+
+        if not options:
+            options.append(discord.SelectOption(label="No roles available", value="0", description="Nothing to select right now."))
+
+        target_label = "staff" if target == "staff" else "ping"
+        action_label = "add" if action == "add" else "remove"
+        super().__init__(
+            placeholder=f"Choose a role to {action_label} from {target_label} roles...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        if not roles:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can edit default ticket roles.", ephemeral=True)
+            return
+
+        role_id = int(self.values[0])
+        role = interaction.guild.get_role(role_id)
+        if role is None or role.is_default():
+            await interaction.response.send_message("That role is no longer available.", ephemeral=True)
+            return
+
+        if self.target == "staff":
+            if self.action == "add":
+                self.bot.config_store.add_staff_role(interaction.guild.id, role.id)
+                result = f"Added {role.mention} as a ticket staff role."
+            else:
+                self.bot.config_store.remove_staff_role(interaction.guild.id, role.id)
+                result = f"Removed {role.mention} from ticket staff roles."
+        else:
+            if self.action == "add":
+                self.bot.config_store.add_ping_role(interaction.guild.id, role.id)
+                result = f"Added {role.mention} as a default ticket ping role."
+            else:
+                self.bot.config_store.remove_ping_role(interaction.guild.id, role.id)
+                result = f"Removed {role.mention} from default ticket ping roles."
+
+        embed = build_role_config_embed(self.bot, interaction.guild, self.target, self.action)
+        embed.add_field(name="Updated", value=result, inline=False)
+        await interaction.response.edit_message(embed=embed, view=RoleConfigSelectView(self.bot, interaction.guild, self.target, self.action))
+
+
+class RoleConfigSelectView(discord.ui.View):
+    def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild_id = guild.id
+        self.target = target
+        self.action = action
+        self.add_item(ConfigRoleSelect(bot, guild, target, action))
+
+    @discord.ui.button(label="Refresh List", style=discord.ButtonStyle.primary, row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        embed = build_role_config_embed(self.bot, interaction.guild, self.target, self.action)
+        await interaction.response.edit_message(embed=embed, view=RoleConfigSelectView(self.bot, interaction.guild, self.target, self.action))
+
+
+async def send_role_config_panel(interaction: discord.Interaction, bot: "TicketBot", target: str, action: str) -> None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Only admins can edit default ticket roles.", ephemeral=True)
+        return
+
+    embed = build_role_config_embed(bot, interaction.guild, target, action)
+    await interaction.response.send_message(embed=embed, view=RoleConfigSelectView(bot, interaction.guild, target, action), ephemeral=True)
+
+
 class TicketAdminPanelView(discord.ui.View):
     def __init__(self, bot: "TicketBot"):
         super().__init__(timeout=600)
@@ -1129,41 +1441,21 @@ class TicketAdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="Add Staff", style=discord.ButtonStyle.secondary, row=0)
     async def add_staff_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "add", "staff"))
+        await send_role_config_panel(interaction, self.bot, "staff", "add")
 
     @discord.ui.button(label="Remove Staff", style=discord.ButtonStyle.secondary, row=0)
     async def remove_staff_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "remove", "staff"))
+        await send_role_config_panel(interaction, self.bot, "staff", "remove")
 
     @discord.ui.button(label="Add Ping Role", style=discord.ButtonStyle.secondary, row=0)
     async def add_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "add", "ping"))
+        await send_role_config_panel(interaction, self.bot, "ping", "add")
 
     @discord.ui.button(label="Remove Ping Role", style=discord.ButtonStyle.secondary, row=0)
     async def remove_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AdminRoleConfigModal(self.bot, "remove", "ping"))
+        await send_role_config_panel(interaction, self.bot, "ping", "remove")
 
-    @discord.ui.button(label="Set Panel GIF", style=discord.ButtonStyle.secondary, row=1)
-    async def set_panel_gif_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AdminPanelGifModal(self.bot))
-
-    @discord.ui.button(label="Add User", style=discord.ButtonStyle.secondary, row=1)
-    async def add_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = self._get_ticket_channel(interaction)
-        if channel is None:
-            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to add users there.", ephemeral=True)
-            return
-        await interaction.response.send_modal(AddUserModal(self.bot, channel))
-
-    @discord.ui.button(label="Remove User", style=discord.ButtonStyle.secondary, row=1)
-    async def remove_user_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = self._get_ticket_channel(interaction)
-        if channel is None:
-            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to remove users there.", ephemeral=True)
-            return
-        await interaction.response.send_modal(RemoveUserModal(self.bot, channel))
-
-    @discord.ui.button(label="Add Role", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Add Role", style=discord.ButtonStyle.secondary, row=1)
     async def add_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         channel = self._get_ticket_channel(interaction)
         if channel is None:
@@ -1171,7 +1463,7 @@ class TicketAdminPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(AddRoleModal(self.bot, channel))
 
-    @discord.ui.button(label="Remove Role", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Remove Role", style=discord.ButtonStyle.secondary, row=1)
     async def remove_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         channel = self._get_ticket_channel(interaction)
         if channel is None:
@@ -1179,7 +1471,7 @@ class TicketAdminPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(RemoveRoleModal(self.bot, channel))
 
-    @discord.ui.button(label="Set Ticket Ping", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Set Ticket Ping", style=discord.ButtonStyle.secondary, row=1)
     async def set_ticket_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         channel = self._get_ticket_channel(interaction)
         if channel is None:
@@ -1187,7 +1479,7 @@ class TicketAdminPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(SetPingRolesModal(self.bot, channel))
 
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=2)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
@@ -1195,7 +1487,6 @@ class TicketAdminPanelView(discord.ui.View):
 
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.edit_message(embed=embed, view=self)
-
 
 @app_commands.guild_only()
 class TicketCommands(commands.GroupCog, group_name="ticket", group_description="Ticket bot commands"):
@@ -1369,6 +1660,121 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             )
 
 
+    @app_commands.command(name="settag", description="Create or update a reusable staff tag response.")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /ticket tag")
+    async def set_tag_command(self, interaction: discord.Interaction, name: str, response: str) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        clean_name = clean_tag_name(name)
+        if not clean_name:
+            await interaction.response.send_message("Use a tag name with letters or numbers.", ephemeral=True)
+            return
+
+        set_tag(self.bot, interaction.guild.id, clean_name, response)
+        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can now use `/ticket tag name:{clean_name}` inside tickets.", ephemeral=True)
+
+    @app_commands.command(name="removetag", description="Remove a reusable staff tag response.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def remove_tag_command(self, interaction: discord.Interaction, name: str) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        clean_name = clean_tag_name(name)
+        existed = remove_tag(self.bot, interaction.guild.id, clean_name)
+        if existed:
+            await interaction.response.send_message(f"Removed tag `{clean_name}`.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"No tag named `{clean_name}` was found.", ephemeral=True)
+
+    @app_commands.command(name="tags", description="List saved staff tag responses for this server.")
+    @app_commands.checks.has_permissions(manage_channels=True)
+    async def list_tags_command(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        tags = get_tags(self.bot, interaction.guild.id)
+        if not tags:
+            await interaction.response.send_message("No tags are saved yet. Use `/ticket settag` first.", ephemeral=True)
+            return
+
+        lines = [f"`{name}` — {truncate(value, 120)}" for name, value in sorted(tags.items())]
+        await interaction.response.send_message("Saved tags:\n" + "\n".join(lines), ephemeral=True)
+
+    @app_commands.command(name="tag", description="Send a saved staff tag response inside a ticket.")
+    async def send_tag_command(self, interaction: discord.Interaction, name: str) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("Use `/ticket tag` inside a ticket channel.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can use saved tags.", ephemeral=True)
+            return
+
+        clean_name = clean_tag_name(name)
+        response = get_tags(self.bot, interaction.guild.id).get(clean_name)
+        if not response:
+            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/ticket tags` to view saved tags.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(response, allowed_mentions=discord.AllowedMentions.none())
+
+    @app_commands.command(name="notes", description="Create or open the staff-only notes thread for this ticket.")
+    async def ticket_notes(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("Use `/ticket notes` inside a ticket channel.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can open staff notes.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        thread, status = await create_or_get_notes_thread(self.bot, interaction.guild, channel, interaction.user)
+        if thread is None:
+            await interaction.followup.send(status, ephemeral=True)
+            return
+
+        msg = "Created" if status == "created" else "Opened existing"
+        await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
+
+    @app_commands.command(name="log", description="Download a saved ticket transcript by ticket ID/channel ID.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def ticket_log(self, interaction: discord.Interaction, ticket_id: str) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        safe_ticket_id = re.sub(r"[^0-9]", "", ticket_id)
+        if not safe_ticket_id:
+            await interaction.response.send_message("Use the numeric Ticket ID from the ticket close log.", ephemeral=True)
+            return
+
+        path = get_ticket_log_path(interaction.guild.id, safe_ticket_id)
+        if not path.exists():
+            await interaction.response.send_message(f"No saved transcript found for Ticket ID `{safe_ticket_id}`.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"Saved transcript for Ticket ID `{safe_ticket_id}`:",
+            file=discord.File(path),
+            ephemeral=True,
+        )
+
     @app_commands.command(name="admin", description="Open the ticket admin control panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def ticket_admin(self, interaction: discord.Interaction) -> None:
@@ -1410,7 +1816,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="Use `/ticket admin` or the ticket buttons to claim, ping, add/remove users, and add/remove roles for that specific ticket.",
+            value="Use the ticket buttons to claim/ping and `/ticket admin` inside a ticket for role and ping tools. Use `/ticket notes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
