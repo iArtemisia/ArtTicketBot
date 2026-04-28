@@ -183,6 +183,7 @@ async def fetch_member_safe(guild: discord.Guild, user_id: int) -> Optional[disc
     member = guild.get_member(user_id)
     if member is not None:
         return member
+
     try:
         return await guild.fetch_member(user_id)
     except (discord.NotFound, discord.HTTPException):
@@ -332,13 +333,24 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
             embed_links=True,
         )
 
-    channel = await guild.create_text_channel(
-        name=channel_name,
-        category=category,
-        topic=build_ticket_topic(owner_id=interaction.user.id, ticket_type="ticket"),
-        overwrites=overwrites,
-        reason=f"Ticket opened by {interaction.user} ({interaction.user.id})",
-    )
+    try:
+        channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            topic=build_ticket_topic(owner_id=interaction.user.id, ticket_type="ticket"),
+            overwrites=overwrites,
+            reason=f"Ticket opened by {interaction.user} ({interaction.user.id})",
+        )
+    except discord.Forbidden:
+        return None, (
+            "I couldn't create the ticket channel.\n\n"
+            "Make sure the bot can:\n"
+            "• View the ticket category\n"
+            "• Manage Channels\n"
+            "• Send Messages"
+        )
+    except discord.HTTPException:
+        return None, "Discord refused the ticket channel create request. Try again in a moment."
 
     mention_roles = " ".join(f"<@&{role.id}>" for role in get_staff_roles(bot, guild))
     opening_ping = f"{interaction.user.mention} {mention_roles}".strip()
@@ -357,20 +369,28 @@ async def create_ticket_channel(bot: "TicketBot", interaction: discord.Interacti
     embed.add_field(name="Claimed By", value="Not claimed yet", inline=True)
     embed.set_footer(text=f"User ID: {interaction.user.id}")
 
-    await channel.send(
-        content=opening_ping,
-        embed=embed,
-        view=TicketChannelView(bot),
-        allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-    )
+    try:
+        await channel.send(
+            content=opening_ping,
+            embed=embed,
+            view=TicketChannelView(bot),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+        )
+    except discord.Forbidden:
+        return None, "I created the channel but couldn't post the starter message. Check the category/channel permissions."
+    except discord.HTTPException:
+        return None, "I created the channel but Discord rejected the starter message."
 
-    await log_event(
-        bot,
-        guild,
-        title="Ticket Opened",
-        description=f"Channel: {channel.mention}\nUser: {interaction.user.mention}",
-        color=discord.Color.green(),
-    )
+    try:
+        await log_event(
+            bot,
+            guild,
+            title="Ticket Opened",
+            description=f"Channel: {channel.mention}\nUser: {interaction.user.mention}",
+            color=discord.Color.green(),
+        )
+    except discord.HTTPException:
+        pass
 
     return channel, "created"
 
@@ -720,40 +740,42 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
     @app_commands.command(name="panelgif", description="Set or clear the GIF/image shown on the ticket panel.")
     @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(image_url="Direct image URL. Imgur page URLs are also accepted. Leave blank to clear.")
-    async def panel_gif(self, interaction: discord.Interaction, image_url: Optional[str] = None) -> None:
+    @app_commands.describe(
+        image_url="Direct image URL. Imgur page URLs are also accepted. Leave blank to clear.",
+        image_file="Upload a GIF/image directly to use on the panel.",
+    )
+    async def panel_gif(
+        self,
+        interaction: discord.Interaction,
+        image_url: Optional[str] = None,
+        image_file: Optional[discord.Attachment] = None,
+    ) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
 
-        cleaned = normalize_panel_image_url(image_url or "")
+        chosen = image_file.url if image_file else (image_url or "")
+        cleaned = normalize_panel_image_url(chosen)
         current = self.bot.config_store.get_guild(interaction.guild.id)
-
-        if cleaned:
-            self.bot.config_store.update_guild(
-                interaction.guild.id,
-                ticket_category_id=current.get("ticket_category_id"),
-                log_channel_id=current.get("log_channel_id"),
-                staff_role_ids=current.get("staff_role_ids", []),
-                panel_gif_url=cleaned,
-            )
-            await interaction.response.send_message(
-                f"Saved the panel GIF/image URL for this server:\n{cleaned}",
-                ephemeral=True,
-            )
-            return
 
         self.bot.config_store.update_guild(
             interaction.guild.id,
             ticket_category_id=current.get("ticket_category_id"),
             log_channel_id=current.get("log_channel_id"),
             staff_role_ids=current.get("staff_role_ids", []),
-            panel_gif_url="",
+            panel_gif_url=cleaned,
         )
-        await interaction.response.send_message(
-            "Cleared the saved panel GIF/image URL for this server.",
-            ephemeral=True,
-        )
+
+        if cleaned:
+            await interaction.response.send_message(
+                f"Saved the panel GIF/image URL for this server:\n{cleaned}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "Cleared the saved panel GIF/image URL for this server.",
+                ephemeral=True,
+            )
 
     @app_commands.command(name="config", description="Show the ticket configuration for this server.")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -810,19 +832,6 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             color=discord.Color.blurple(),
             timestamp=now_utc(),
         )
-        embed.add_field(
-            name="How setup works",
-            value=(
-                "`/ticket setup` saves the category where ticket channels are created "
-                "and the log channel where transcripts/logs are sent."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="Inside the ticket",
-            value="Buttons included: **Claim**, **Add User**, **Remove User**, **Close**",
-            inline=False,
-        )
         panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
         if panel_gif_url:
             embed.set_image(url=panel_gif_url)
@@ -846,6 +855,15 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 "- `category` must be a real Discord category\n"
                 "- `log_channel` must be a normal text channel\n\n"
                 "Then use `/ticket panel` in the channel where you want the ticket embed posted."
+            )
+        elif isinstance(error, app_commands.CommandInvokeError) and isinstance(error.original, discord.Forbidden):
+            message = (
+                "The bot was blocked by channel or category permissions.\n\n"
+                "Make sure it can:\n"
+                "• View Channel\n"
+                "• Send Messages\n"
+                "• Embed Links\n"
+                "• Manage Channels"
             )
         else:
             raise error
