@@ -598,9 +598,6 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
 
     if isinstance(channel, discord.TextChannel) and is_ticket_channel(channel):
         owner_id = get_ticket_owner_id(channel)
-        ticket_ping_roles = get_ticket_ping_roles(bot, guild, channel)
-        extra_roles = get_ticket_extra_roles(bot, guild, channel)
-        extra_users = get_ticket_extra_users(bot, guild, channel)
         claimed_by = get_claimed_by_id(channel)
 
         embed.add_field(name="Current ticket", value=channel.mention, inline=False)
@@ -608,22 +605,15 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
         embed.add_field(name="Ticket type", value=get_ticket_kind(channel).title(), inline=True)
         embed.add_field(name="Ticket owner", value=format_user_reference(guild, owner_id), inline=False)
         embed.add_field(name="Claimed by", value=format_user_reference(guild, claimed_by), inline=False)
-        embed.add_field(name="Ticket ping roles", value=format_role_list(ticket_ping_roles), inline=False)
-        embed.add_field(name="Extra allowed roles", value=format_role_list(extra_roles), inline=False)
         embed.add_field(
-            name="Extra allowed users",
-            value="\n".join(user.mention for user in extra_users) if extra_users else "None",
-            inline=False,
-        )
-        embed.add_field(
-            name="Ticket-specific tools",
-            value="Use **Add Role**, **Remove Role**, or **Set Ticket Ping** below to edit this one ticket.",
+            name="Ticket-specific overrides",
+            value="Removed. Use the normal/priority access and ping role settings above for ticket defaults.",
             inline=False,
         )
     else:
         embed.add_field(
-            name="Ticket-specific tools",
-            value="Run `/ticket admin` inside a ticket channel to edit that ticket's role permissions and ping roles.",
+            name="Ticket-specific overrides",
+            value="Removed. This admin panel now only manages normal/priority default access, ping, and opener roles.",
             inline=False,
         )
 
@@ -1080,137 +1070,6 @@ class RemoveUserModal(discord.ui.Modal, title="Remove User From Ticket"):
         await self.channel.set_permissions(member, overwrite=None, reason=f"Removed from ticket by {interaction.user}")
         await self.channel.send(f"➖ {member.mention} was removed from this ticket by {interaction.user.mention}.")
         await interaction.response.send_message(f"Removed {member.mention} from the ticket.", ephemeral=True)
-
-
-class AddRoleModal(discord.ui.Modal, title="Add Role To Ticket"):
-    role_input = discord.ui.TextInput(
-        label="Role ID or mention",
-        placeholder="Paste a role mention or role ID",
-        max_length=64,
-    )
-
-    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.channel = channel
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can add roles.", ephemeral=True)
-            return
-
-        role_id = extract_id(str(self.role_input.value))
-        if role_id is None:
-            await interaction.response.send_message("I could not find a role ID in that input.", ephemeral=True)
-            return
-
-        role = interaction.guild.get_role(role_id)
-        if role is None:
-            await interaction.response.send_message("That role is not in this server.", ephemeral=True)
-            return
-
-        overwrite = self.channel.overwrites_for(role)
-        overwrite.view_channel = True
-        overwrite.send_messages = True
-        overwrite.read_message_history = True
-        overwrite.attach_files = True
-        overwrite.embed_links = True
-
-        await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role added to ticket by {interaction.user}")
-        await self.channel.send(f"🔓 {role.mention} can now see this ticket.")
-        await interaction.response.send_message(f"Added {role.mention} to this ticket.", ephemeral=True)
-
-
-class RemoveRoleModal(discord.ui.Modal, title="Remove Role From Ticket"):
-    role_input = discord.ui.TextInput(
-        label="Role ID or mention",
-        placeholder="Paste a role mention or role ID",
-        max_length=64,
-    )
-
-    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.channel = channel
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can remove roles.", ephemeral=True)
-            return
-
-        role_id = extract_id(str(self.role_input.value))
-        if role_id is None:
-            await interaction.response.send_message("I could not find a role ID in that input.", ephemeral=True)
-            return
-
-        role = interaction.guild.get_role(role_id)
-        if role is None:
-            await interaction.response.send_message("That role is not in this server.", ephemeral=True)
-            return
-
-        if role.is_default():
-            await interaction.response.send_message("You can't edit @everyone here.", ephemeral=True)
-            return
-
-        overwrite = self.channel.overwrites_for(role)
-        overwrite.view_channel = False
-        overwrite.send_messages = False
-        overwrite.read_message_history = False
-        overwrite.attach_files = False
-        overwrite.embed_links = False
-
-        await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role removed from ticket by {interaction.user}")
-        await self.channel.send(f"🔒 {role.mention} can no longer see this ticket.")
-        await interaction.response.send_message(f"Removed {role.mention} from this ticket.", ephemeral=True)
-
-
-class SetPingRolesModal(discord.ui.Modal, title="Set Ticket Ping Roles"):
-    roles_input = discord.ui.TextInput(
-        label="Role mentions or IDs",
-        placeholder="Example: @Support @Moderators",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=400,
-    )
-
-    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.channel = channel
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can edit ping roles.", ephemeral=True)
-            return
-
-        role_ids = extract_ids(str(self.roles_input.value))
-        valid_roles: list[discord.Role] = []
-        for role_id in role_ids:
-            role = interaction.guild.get_role(role_id)
-            if role is not None and not role.is_default():
-                valid_roles.append(role)
-
-        await update_ticket_metadata(self.channel, ping_role_ids=[role.id for role in valid_roles])
-
-        if valid_roles:
-            mentions = ", ".join(role.mention for role in valid_roles)
-            await self.channel.send(f"📣 Ticket ping roles updated by {interaction.user.mention}: {mentions}")
-            await interaction.response.send_message(f"Updated ticket ping roles: {mentions}", ephemeral=True)
-        else:
-            await self.channel.send(f"📣 Ticket ping roles cleared by {interaction.user.mention}.")
-            await interaction.response.send_message("Cleared the ticket ping roles.", ephemeral=True)
 
 
 class AdminRoleConfigModal(discord.ui.Modal):
@@ -1723,31 +1582,7 @@ class TicketAdminPanelView(discord.ui.View):
     async def remove_priority_opener_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await send_role_config_panel(interaction, self.bot, "priority_allowed", "remove")
 
-    @discord.ui.button(label="Add Ticket Role", style=discord.ButtonStyle.secondary, row=3)
-    async def add_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = self._get_ticket_channel(interaction)
-        if channel is None:
-            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to add roles there.", ephemeral=True)
-            return
-        await interaction.response.send_modal(AddRoleModal(self.bot, channel))
-
-    @discord.ui.button(label="Remove Ticket Role", style=discord.ButtonStyle.secondary, row=3)
-    async def remove_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = self._get_ticket_channel(interaction)
-        if channel is None:
-            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to remove roles there.", ephemeral=True)
-            return
-        await interaction.response.send_modal(RemoveRoleModal(self.bot, channel))
-
-    @discord.ui.button(label="Set Ticket Ping", style=discord.ButtonStyle.secondary, row=3)
-    async def set_ticket_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = self._get_ticket_channel(interaction)
-        if channel is None:
-            await interaction.response.send_message("Run `/ticket admin` inside a ticket channel to edit that ticket's ping roles.", ephemeral=True)
-            return
-        await interaction.response.send_modal(SetPingRolesModal(self.bot, channel))
-
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=4)
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=3)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
@@ -1756,7 +1591,6 @@ class TicketAdminPanelView(discord.ui.View):
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.edit_message(embed=embed, view=self)
 
-@app_commands.guild_only()
 @app_commands.guild_only()
 class TicketCommands(commands.GroupCog, group_name="ticket", group_description="Ticket bot commands"):
     def __init__(self, bot: "TicketBot"):
