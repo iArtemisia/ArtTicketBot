@@ -2287,27 +2287,46 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             return
 
         embed = discord.Embed(
-            title="Open a Ticket",
+            title="Open a ticket!",
             description=(
-                "Press one of the buttons below to open a private ticket.\n\n"
-                "Normal tickets are available to everyone. Priority tickets require a configured priority opener role."
+                "**Please ensure that you only make a ticket when it is necessary:**\n\n"
+                "For information about the server and wipe schedule, please see 📌 #server-list-wipe\n"
+                "For information regarding our rules refer to ‼️ #rules\n\n"
+                "For information about claiming kits ♻️ #auto-kit\n"
+                "To view our shops: 🤑 #starz-shop\n\n"
+                "For information about our offline protection system.\n"
+                "🚧 #offline-protection\n\n"
+                "**If you make a ticket about team size we require the following**\n\n"
+                "A clip of the suspected team being over team limit\n"
+                "Suspected team's usernames (requires just 1)\n\n"
+                "**Tickets will be auto-closed without these.**\n\n"
+                "If you are making a ticket asking to be unlinked we need:\n"
+                "a reason as to why you need unlinked (left Discord / changed gamertag)\n"
+                "proof that you own the account (receipts / screenshots)\n\n"
+                "If you are making a report about over-teaming please provide:\n"
+                "a clip of the team that is over team limit\n"
+                "that team's gamertags\n"
+                "the server this is on\n"
+                "the grid they live\n\n"
+                "**PRIORITY TICKETS!**\n"
+                "Starz Empire Priority Ticket Support\n\n"
+                "These tickets are only accessible to our admin management team:\n"
+                "HEAD ADMINS\n"
+                "ADMIN MANAGEMENT\n\n"
+                "Only available to:\n"
+                "TOP SUPPORTERS\n"
+                "🤑 MEGA SUPPORTER 🤑\n\n"
+                "**USES**\n"
+                "Moves ticket to top of the queue\n"
+                "Professional 1-on-1 customer/player service with our top-ranking admins\n"
+                "Bypass the chain of command and speak to the top-ranking admins/owners\n\n"
+                "Please understand that wait times may be longer as there are a very limited amount of us. "
+                "If you need instant support, consider making a normal ticket as regular admins cannot see these tickets."
             ),
-            color=discord.Color.blurple(),
+            color=discord.Color.from_rgb(255, 0, 170),
             timestamp=now_utc(),
         )
-        embed.add_field(
-            name="How setup works",
-            value=(
-                "`/ticket setup` sets where tickets are created and where closed-ticket transcripts go.\n"
-                "`/ticket admin` opens the role dropdown panel for normal/priority access and pings."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="Inside the ticket",
-            value="Buttons included: **Ping Team** with a 10-minute cooldown, **Claim**, **Unclaim**, and **Close**.",
-            inline=False,
-        )
+        embed.set_author(name="STARZ")
         panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
         if panel_gif_url:
             embed.set_image(url=panel_gif_url)
