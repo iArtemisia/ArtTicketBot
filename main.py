@@ -44,7 +44,7 @@ ROLE_TARGETS: dict[str, dict[str, str]] = {
         "config_key": "staff_pool_role_ids",
         "title": "Staff Role Filter",
         "short": "staff filter",
-        "current_label": "Roles shown in ticket admin dropdowns",
+        "current_label": "Roles shown in ticket staff dropdowns",
         "description": "roles considered staff candidates in ticket admin dropdowns",
     },
     "normal_staff": {
@@ -398,19 +398,24 @@ def get_roles_from_config(bot: "TicketBot", guild: discord.Guild, target: str) -
             roles.append(role)
     return roles
 
-
 def get_staff_filter_roles(bot: "TicketBot", guild: discord.Guild) -> list[discord.Role]:
-    """Roles allowed to appear in ticket-admin role dropdowns.
+    """Roles allowed to appear in ticket staff/admin role dropdowns.
 
-    If this list is empty, the admin dropdowns fall back to all non-managed roles so
-    a brand-new server can still configure itself. Once you add roles here, ticket
-    access/ping/opener dropdowns only show those staff-filter roles.
+    If this list is empty, the admin dropdowns fall back to all non-managed
+    server roles so a brand-new server can still configure itself.
+
+    This filter is only used for staff-facing ticket roles:
+    normal access, normal ping, priority access, and priority ping.
+
+    Priority opener is intentionally NOT filtered because it is meant for
+    non-staff roles too, such as VIP, Donator, Premium, Supporter, etc.
     """
     return get_roles_from_config(bot, guild, "staff_pool")
 
 
 def get_staff_filter_role_ids(bot: "TicketBot", guild_id: int) -> set[int]:
     return set(get_role_ids_from_config(bot, guild_id, "staff_pool"))
+
 
 
 def get_guild_ping_roles(bot: "TicketBot", guild: discord.Guild) -> list[discord.Role]:
@@ -498,15 +503,19 @@ def get_selectable_roles(bot: "TicketBot", guild: discord.Guild, target: str, ac
     roles = [role for role in guild.roles if not role.is_default() and not role.managed]
     roles.sort(key=lambda role: role.position, reverse=True)
 
+    # Staff Filter only narrows staff-facing ticket dropdowns.
+    # Priority Opener is intentionally NOT filtered to staff roles because
+    # it is meant for player/customer roles like VIP, Donator, Premium, etc.
+    staff_filtered_targets = {"normal_staff", "normal_ping", "priority_staff", "priority_ping"}
+
     if action == "add":
-        if normalized_target != "staff_pool":
+        if normalized_target in staff_filtered_targets:
             staff_filter_ids = get_staff_filter_role_ids(bot, guild.id)
             if staff_filter_ids:
                 roles = [role for role in roles if role.id in staff_filter_ids]
         roles = [role for role in roles if role.id not in configured]
     else:
-        # Removal dropdowns always show the currently configured roles, even if
-        # they are no longer part of the staff filter. This keeps cleanup possible.
+        # Removal dropdowns always show currently configured roles so cleanup is possible.
         roles = [role for role in roles if role.id in configured]
 
     return roles[:25]
@@ -526,12 +535,24 @@ def build_role_config_embed(bot: "TicketBot", guild: discord.Guild, target: str,
 
     if normalized_target == "staff_pool":
         description = (
-            "Pick which Discord roles should be considered staff roles for this bot's admin dropdowns.\n\n"
-            "Once this list is configured, the other role dropdowns only show these staff-filter roles."
+            "Pick which Discord roles should appear in staff/admin ticket dropdowns.\
+\
+"
+            "Once this list is configured, normal/priority **access** and **ping** dropdowns only show these staff-filter roles. "
+            "Priority Opener is not staff-filtered because it is meant for non-staff roles too."
+        )
+    elif normalized_target == "priority_allowed":
+        description = (
+            "Pick which Discord roles are allowed to open priority tickets.\
+\
+"
+            "This dropdown intentionally shows non-staff roles too, such as VIP, Donator, Premium, Supporter, customer/player roles, etc."
         )
     else:
         description = (
-            "Pick a role from the dropdown below.\n\n"
+            "Pick a role from the dropdown below.\
+\
+"
             "Already configured roles are shown here so you do not need to paste role IDs."
         )
 
@@ -543,22 +564,37 @@ def build_role_config_embed(bot: "TicketBot", guild: discord.Guild, target: str,
     )
     embed.add_field(name=target_info["current_label"], value=format_role_list(configured_roles), inline=False)
 
-    if normalized_target != "staff_pool":
+    if normalized_target not in {"staff_pool", "priority_allowed"}:
         staff_filter_text = (
             format_role_list(staff_filter_roles)
             if staff_filter_roles
             else "Not configured yet. Until you add staff-filter roles, this dropdown falls back to all server roles."
         )
         embed.add_field(name="Staff role filter", value=staff_filter_text, inline=False)
+    elif normalized_target == "priority_allowed":
+        embed.add_field(
+            name="Staff role filter",
+            value="Not applied. Priority opener roles can be non-staff roles.",
+            inline=False,
+        )
 
     helper = (
         f"Dropdown shows roles that are not already configured as {target_info['description']}."
         if action == "add"
         else f"Dropdown shows roles that are currently configured as {target_info['description']}."
     )
-    if normalized_target != "staff_pool" and action == "add" and staff_filter_roles:
-        helper += "\nThis list is filtered to your configured staff-filter roles."
-    embed.add_field(name="Dropdown status", value=f"{helper}\nAvailable choices shown: {len(selectable_roles)} / 25 max.", inline=False)
+    if normalized_target in {"normal_staff", "normal_ping", "priority_staff", "priority_ping"} and action == "add" and staff_filter_roles:
+        helper += "\
+This list is filtered to your configured staff-filter roles."
+    elif normalized_target == "priority_allowed" and action == "add":
+        helper += "\
+Priority Opener is intentionally not filtered to staff roles."
+    elif normalized_target == "staff_pool":
+        helper += "\
+This dropdown intentionally shows all non-managed server roles so you can build the staff filter."
+
+    embed.add_field(name="Dropdown status", value=f"{helper}\
+Available choices shown: {len(selectable_roles)} / 25 max.", inline=False)
     embed.set_footer(text="Discord dropdowns can show up to 25 roles at a time.")
     return embed
 
@@ -624,7 +660,6 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
     category = guild.get_channel(config.get("ticket_category_id", 0))
     log_channel = guild.get_channel(config.get("log_channel_id", 0))
 
-    staff_filter_roles = get_staff_filter_roles(bot, guild)
     normal_staff_roles = get_staff_roles(bot, guild)
     normal_ping_roles = get_roles_from_config(bot, guild, "normal_ping")
     priority_staff_roles = get_roles_from_config(bot, guild, "priority_staff")
@@ -634,7 +669,7 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
     embed = discord.Embed(
         title="Ticket Admin Panel",
         description=(
-            "Use the buttons below to configure the staff role filter, normal tickets, priority tickets, pings, and access roles with dropdowns. "
+            "Use the buttons below to configure normal tickets, priority tickets, pings, and access roles with dropdowns. "
             "No Discord role IDs are needed."
         ),
         color=discord.Color.blurple(),
@@ -644,17 +679,20 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
     embed.add_field(name="Closed-ticket log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
     embed.add_field(
         name="Staff role dropdown filter",
-        value=format_role_list(staff_filter_roles) if staff_filter_roles else "Not set — role dropdowns currently show all non-managed server roles.",
+        value=format_role_list(staff_filter_roles) if staff_filter_roles else "Not set — staff-facing dropdowns currently show all non-managed server roles.",
         inline=False,
     )
     embed.add_field(name="Normal ticket access roles", value=format_role_list(normal_staff_roles), inline=False)
     embed.add_field(name="Normal ticket ping roles", value=format_role_list(normal_ping_roles), inline=False)
     embed.add_field(name="Priority ticket access roles", value=format_role_list(priority_staff_roles), inline=False)
     embed.add_field(name="Priority ticket ping roles", value=format_role_list(priority_ping_roles), inline=False)
-    embed.add_field(name="Roles allowed to open priority tickets", value=format_role_list(priority_allowed_roles), inline=False)
+    embed.add_field(name="Priority opener roles (non-staff allowed)", value=format_role_list(priority_allowed_roles), inline=False)
 
     if isinstance(channel, discord.TextChannel) and is_ticket_channel(channel):
         owner_id = get_ticket_owner_id(channel)
+        ticket_ping_roles = get_ticket_ping_roles(bot, guild, channel)
+        extra_roles = get_ticket_extra_roles(bot, guild, channel)
+        extra_users = get_ticket_extra_users(bot, guild, channel)
         claimed_by = get_claimed_by_id(channel)
 
         embed.add_field(name="Current ticket", value=channel.mention, inline=False)
@@ -662,15 +700,22 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
         embed.add_field(name="Ticket type", value=get_ticket_kind(channel).title(), inline=True)
         embed.add_field(name="Ticket owner", value=format_user_reference(guild, owner_id), inline=False)
         embed.add_field(name="Claimed by", value=format_user_reference(guild, claimed_by), inline=False)
+        embed.add_field(name="Ticket ping roles", value=format_role_list(ticket_ping_roles), inline=False)
+        embed.add_field(name="Extra allowed roles", value=format_role_list(extra_roles), inline=False)
         embed.add_field(
-            name="Ticket-specific overrides",
-            value="Removed. Use the normal/priority access and ping role settings above for ticket defaults.",
+            name="Extra allowed users",
+            value="\n".join(user.mention for user in extra_users) if extra_users else "None",
+            inline=False,
+        )
+        embed.add_field(
+            name="Ticket-specific tools",
+            value="Ticket-specific role/ping overrides are removed. Use normal/priority default settings above.",
             inline=False,
         )
     else:
         embed.add_field(
-            name="Ticket-specific overrides",
-            value="Removed. This admin panel now only manages normal/priority default access, ping, and opener roles.",
+            name="Ticket-specific tools",
+            value="Run `/ticket admin` inside a ticket channel to edit that ticket's role permissions and ping roles.",
             inline=False,
         )
 
@@ -1129,6 +1174,137 @@ class RemoveUserModal(discord.ui.Modal, title="Remove User From Ticket"):
         await interaction.response.send_message(f"Removed {member.mention} from the ticket.", ephemeral=True)
 
 
+class AddRoleModal(discord.ui.Modal, title="Add Role To Ticket"):
+    role_input = discord.ui.TextInput(
+        label="Role ID or mention",
+        placeholder="Paste a role mention or role ID",
+        max_length=64,
+    )
+
+    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can add roles.", ephemeral=True)
+            return
+
+        role_id = extract_id(str(self.role_input.value))
+        if role_id is None:
+            await interaction.response.send_message("I could not find a role ID in that input.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(role_id)
+        if role is None:
+            await interaction.response.send_message("That role is not in this server.", ephemeral=True)
+            return
+
+        overwrite = self.channel.overwrites_for(role)
+        overwrite.view_channel = True
+        overwrite.send_messages = True
+        overwrite.read_message_history = True
+        overwrite.attach_files = True
+        overwrite.embed_links = True
+
+        await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role added to ticket by {interaction.user}")
+        await self.channel.send(f"🔓 {role.mention} can now see this ticket.")
+        await interaction.response.send_message(f"Added {role.mention} to this ticket.", ephemeral=True)
+
+
+class RemoveRoleModal(discord.ui.Modal, title="Remove Role From Ticket"):
+    role_input = discord.ui.TextInput(
+        label="Role ID or mention",
+        placeholder="Paste a role mention or role ID",
+        max_length=64,
+    )
+
+    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can remove roles.", ephemeral=True)
+            return
+
+        role_id = extract_id(str(self.role_input.value))
+        if role_id is None:
+            await interaction.response.send_message("I could not find a role ID in that input.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(role_id)
+        if role is None:
+            await interaction.response.send_message("That role is not in this server.", ephemeral=True)
+            return
+
+        if role.is_default():
+            await interaction.response.send_message("You can't edit @everyone here.", ephemeral=True)
+            return
+
+        overwrite = self.channel.overwrites_for(role)
+        overwrite.view_channel = False
+        overwrite.send_messages = False
+        overwrite.read_message_history = False
+        overwrite.attach_files = False
+        overwrite.embed_links = False
+
+        await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role removed from ticket by {interaction.user}")
+        await self.channel.send(f"🔒 {role.mention} can no longer see this ticket.")
+        await interaction.response.send_message(f"Removed {role.mention} from this ticket.", ephemeral=True)
+
+
+class SetPingRolesModal(discord.ui.Modal, title="Set Ticket Ping Roles"):
+    roles_input = discord.ui.TextInput(
+        label="Role mentions or IDs",
+        placeholder="Example: @Support @Moderators",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=400,
+    )
+
+    def __init__(self, bot: "TicketBot", channel: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can edit ping roles.", ephemeral=True)
+            return
+
+        role_ids = extract_ids(str(self.roles_input.value))
+        valid_roles: list[discord.Role] = []
+        for role_id in role_ids:
+            role = interaction.guild.get_role(role_id)
+            if role is not None and not role.is_default():
+                valid_roles.append(role)
+
+        await update_ticket_metadata(self.channel, ping_role_ids=[role.id for role in valid_roles])
+
+        if valid_roles:
+            mentions = ", ".join(role.mention for role in valid_roles)
+            await self.channel.send(f"📣 Ticket ping roles updated by {interaction.user.mention}: {mentions}")
+            await interaction.response.send_message(f"Updated ticket ping roles: {mentions}", ephemeral=True)
+        else:
+            await self.channel.send(f"📣 Ticket ping roles cleared by {interaction.user.mention}.")
+            await interaction.response.send_message("Cleared the ticket ping roles.", ephemeral=True)
+
+
 class AdminRoleConfigModal(discord.ui.Modal):
     roles_input = discord.ui.TextInput(
         label="Role mentions or IDs",
@@ -1221,7 +1397,6 @@ class AdminPanelGifModal(discord.ui.Modal, title="Set Panel GIF or Image"):
             log_channel_id=current.get("log_channel_id"),
             staff_role_ids=current.get("staff_role_ids", []),
             ping_role_ids=current.get("ping_role_ids", []),
-            staff_pool_role_ids=current.get("staff_pool_role_ids", []),
             panel_gif_url=cleaned,
         )
 
@@ -1640,15 +1815,16 @@ class TicketAdminPanelView(discord.ui.View):
     async def remove_staff_filter_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await send_role_config_panel(interaction, self.bot, "staff_pool", "remove")
 
-    @discord.ui.button(label="Add Priority Opener", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Add Priority Opener", style=discord.ButtonStyle.secondary, row=3)
     async def add_priority_opener_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await send_role_config_panel(interaction, self.bot, "priority_allowed", "add")
 
-    @discord.ui.button(label="Remove Priority Opener", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Remove Priority Opener", style=discord.ButtonStyle.secondary, row=3)
     async def remove_priority_opener_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await send_role_config_panel(interaction, self.bot, "priority_allowed", "remove")
 
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=3)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=4)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
@@ -1657,6 +1833,7 @@ class TicketAdminPanelView(discord.ui.View):
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.edit_message(embed=embed, view=self)
 
+@app_commands.guild_only()
 @app_commands.guild_only()
 class TicketCommands(commands.GroupCog, group_name="ticket", group_description="Ticket bot commands"):
     def __init__(self, bot: "TicketBot"):
@@ -1736,11 +1913,10 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 "Used for newly created private ticket channels.\n\n"
                 f"**Closed-ticket log channel:** {real_log_channel.mention}\n"
                 "Used when tickets close. The transcript file will be posted there automatically.\n\n"
-                f"**Staff filter roles configured:** {len(config.get('staff_pool_role_ids', []))}\n"
                 f"**Normal access roles configured:** {len(config.get('staff_role_ids', []))}\n"
                 f"**Priority access roles configured:** {len(config.get('priority_staff_role_ids', []))}\n"
                 f"**Priority opener roles configured:** {len(config.get('priority_allowed_role_ids', []))}\n\n"
-                "Run `/ticket admin` to configure the staff filter first, then pings/access with dropdowns.\n"
+                "Run `/ticket admin` to configure pings/access with dropdowns.\n"
                 "Run `/ticket panel` in the channel where you want the ticket embed posted."
             ),
             ephemeral=True,
@@ -1827,7 +2003,6 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             priority_staff_role_ids=current.get("priority_staff_role_ids", []),
             priority_ping_role_ids=current.get("priority_ping_role_ids", []),
             priority_allowed_role_ids=current.get("priority_allowed_role_ids", []),
-            staff_pool_role_ids=current.get("staff_pool_role_ids", []),
             panel_gif_url=cleaned,
             tags=current.get("tags", {}),
             notes_thread_ids=current.get("notes_thread_ids", {}),
@@ -1936,7 +2111,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         msg = "Created" if status == "created" else "Opened existing"
         await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
 
-    @app_commands.command(name="controls", description="Open staff-only controls for the current ticket.")
+    @app_commands.command(name="controls", description="Open staff-only controls for this ticket.")
     async def ticket_controls(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -1948,21 +2123,16 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             return
 
         if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can open ticket controls.", ephemeral=True)
+            await interaction.response.send_message("Only ticket staff can use ticket controls.", ephemeral=True)
             return
 
         embed = discord.Embed(
-            title="Staff Ticket Controls",
-            description=(
-                "These controls are only shown to you. Regular users only see the public **Ping Team** button.\n\n"
-                "Use **Claim** when you are handling the ticket, **Unclaim** if you need to release it, or **Close** when finished."
-            ),
+            title="Ticket Staff Controls",
+            description="Use these private buttons to claim, unclaim, or close this ticket.",
             color=discord.Color.blurple(),
             timestamp=now_utc(),
         )
-        embed.add_field(name="Ticket", value=channel.mention, inline=False)
         embed.add_field(name="Ticket Number", value=f"`{get_ticket_number(channel)}`", inline=True)
-        embed.add_field(name="Ticket Type", value=get_ticket_kind(channel).title(), inline=True)
         embed.add_field(name="Claimed By", value=format_user_reference(interaction.guild, get_claimed_by_id(channel)), inline=False)
         await interaction.response.send_message(embed=embed, view=StaffTicketControlsView(self.bot), ephemeral=True)
 
@@ -1997,10 +2167,15 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Priority access roles", value=format_role_list(get_roles_from_config(self.bot, interaction.guild, "priority_staff")), inline=False)
         embed.add_field(name="Priority ping roles", value=format_role_list(get_roles_from_config(self.bot, interaction.guild, "priority_ping")), inline=False)
         embed.add_field(name="Priority opener roles", value=format_role_list(get_roles_from_config(self.bot, interaction.guild, "priority_allowed")), inline=False)
+        embed.add_field(
+            name="Priority opener dropdown",
+            value="Can include non-staff roles. This is for roles like VIP, Donator, Premium, Supporter, etc.",
+            inline=False,
+        )
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="User-facing ticket button: **Ping Team** with a 10-minute cooldown. Staff can use `/ticket controls` for **Claim**, **Unclaim**, and **Close**, and `/ticket notes` for staff notes.",
+            value="Public ticket button: **Ping Team** only. Staff use `/ticket controls` for **Claim**, **Unclaim**, and **Close**. Use `/ticket notes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
@@ -2040,7 +2215,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
         embed.add_field(
             name="Inside the ticket",
-            value="User-facing button: **Ping Team** with a 10-minute cooldown. Staff controls are opened with `/ticket controls` inside the ticket.",
+            value="Buttons included: **Ping Team** with a 10-minute cooldown, **Claim**, **Unclaim**, and **Close**.",
             inline=False,
         )
         panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
