@@ -1101,7 +1101,7 @@ async def create_ticket_channel(
         if priority
         else "Thanks for opening a ticket. A staff member will help you soon.\n\n"
     )
-    description += "Users can use **Ping Team** with a 10-minute cooldown. Staff can run `/ticket controls` for **Claim**, **Unclaim**, and **Close**."
+    description += "Use **Ping Team** if you need staff attention."
 
     embed = discord.Embed(
         title=f"{config['emoji']} {title_prefix}",
@@ -1473,13 +1473,6 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             await interaction.response.send_message("This does not look like a valid ticket channel.", ephemeral=True)
             return
 
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message(
-                "Only ticket staff can close this ticket.",
-                ephemeral=True,
-            )
-            return
-
         reason_text = str(self.reason.value).strip() or "No reason provided."
         await interaction.response.send_message("Closing the ticket and saving transcript...", ephemeral=True)
 
@@ -1577,10 +1570,11 @@ class TicketPanelView(discord.ui.View):
 class TicketChannelView(discord.ui.View):
     """Public ticket controls.
 
-    Discord does not support hiding individual buttons from only some users on one shared
-    message. To keep normal users from seeing staff-only controls, the public ticket
-    message only has Ping Team. Staff use `/ticket controls` inside the ticket to open
-    an ephemeral staff-only control panel with Claim, Unclaim, and Close.
+    The buttons are visible to everyone who can see the private ticket channel.
+    Permission checks happen inside each button:
+    - Ping Team: ticket owner or staff, with a 10-minute cooldown.
+    - Claim/Unclaim: staff only, and the ticket creator cannot claim/unclaim their own ticket.
+    - Close: public to users who can access the ticket channel.
     """
 
     def __init__(self, bot: "TicketBot"):
@@ -1632,6 +1626,97 @@ class TicketChannelView(discord.ui.View):
             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
         )
         await interaction.response.send_message("Pinged the configured ticket roles. This ticket can ping again in 10 minutes.", ephemeral=True)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="ticket:claim", row=0)
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        owner_id = get_ticket_owner_id(channel)
+        if owner_id == interaction.user.id:
+            await interaction.response.send_message("You cannot claim your own ticket.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can claim tickets.", ephemeral=True)
+            return
+
+        claimed_by = get_claimed_by_id(channel)
+        if claimed_by == interaction.user.id:
+            await interaction.response.send_message("You already claimed this ticket.", ephemeral=True)
+            return
+        if claimed_by is not None:
+            await interaction.response.send_message(
+                f"This ticket is already claimed by {format_user_reference(interaction.guild, claimed_by)}. It must be unclaimed first.",
+                ephemeral=True,
+            )
+            return
+
+        await update_ticket_metadata(channel, claimed_by=interaction.user.id)
+        await safe_edit_channel_name(
+            channel,
+            claimed_channel_name(interaction.user, channel),
+            reason=f"Ticket claimed by {interaction.user} ({interaction.user.id})",
+        )
+        await channel.send(f"📌 Ticket claimed by {interaction.user.mention} (`{interaction.user.id}`).")
+        await interaction.response.send_message("You claimed this ticket.", ephemeral=True)
+
+    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.secondary, custom_id="ticket:unclaim", row=0)
+    async def unclaim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        owner_id = get_ticket_owner_id(channel)
+        if owner_id == interaction.user.id:
+            await interaction.response.send_message("You cannot unclaim your own ticket.", ephemeral=True)
+            return
+
+        if not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message("Only ticket staff can unclaim tickets.", ephemeral=True)
+            return
+
+        claimed_by = get_claimed_by_id(channel)
+        if claimed_by is None:
+            await interaction.response.send_message("This ticket is not currently claimed.", ephemeral=True)
+            return
+
+        can_unclaim = claimed_by == interaction.user.id or interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_channels
+        if not can_unclaim:
+            await interaction.response.send_message(
+                f"Only the staff member who claimed this ticket or an admin can unclaim it. Claimed by: {format_user_reference(interaction.guild, claimed_by)}",
+                ephemeral=True,
+            )
+            return
+
+        await update_ticket_metadata(channel, claimed_by=0)
+        await safe_edit_channel_name(
+            channel,
+            ticket_base_channel_name(channel),
+            reason=f"Ticket unclaimed by {interaction.user} ({interaction.user.id})",
+        )
+        await channel.send(f"📌 Ticket unclaimed by {interaction.user.mention} (`{interaction.user.id}`).")
+        await interaction.response.send_message("You unclaimed this ticket.", ephemeral=True)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="ticket:close", row=0)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
 
 
 class StaffTicketControlsView(discord.ui.View):
@@ -2201,31 +2286,6 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         msg = "Created" if status == "created" else "Opened existing"
         await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
 
-    @app_commands.command(name="controls", description="Open staff-only controls for this ticket.")
-    async def ticket_controls(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-            return
-
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("Use `/ticket controls` inside a ticket channel.", ephemeral=True)
-            return
-
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can use ticket controls.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="Ticket Staff Controls",
-            description="Use these private buttons to claim, unclaim, or close this ticket.",
-            color=discord.Color.blurple(),
-            timestamp=now_utc(),
-        )
-        embed.add_field(name="Ticket Number", value=f"`{get_ticket_number(channel)}`", inline=True)
-        embed.add_field(name="Claimed By", value=format_user_reference(interaction.guild, get_claimed_by_id(channel)), inline=False)
-        await interaction.response.send_message(embed=embed, view=StaffTicketControlsView(self.bot), ephemeral=True)
-
     @app_commands.command(name="admin", description="Open the ticket admin control panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def ticket_admin(self, interaction: discord.Interaction) -> None:
@@ -2265,7 +2325,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="Public ticket button: **Ping Team** only. Staff use `/ticket controls` for **Claim**, **Unclaim**, and **Close**. Use `/ticket notes` for staff notes.",
+            value="Public ticket buttons: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket creators cannot claim/unclaim their own tickets. Use `/ticket notes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
