@@ -668,6 +668,23 @@ def remove_tag(bot: "TicketBot", guild_id: int, name: str) -> bool:
     return existed
 
 
+def tag_choices(bot: "TicketBot", guild_id: int, current: str = "") -> list[app_commands.Choice[str]]:
+    """Return autocomplete choices for saved tag names."""
+    query = clean_tag_name(current)
+    names = sorted(get_tags(bot, guild_id).keys())
+    if query:
+        names = [name for name in names if query in name]
+    return [app_commands.Choice(name=name, value=name) for name in names[:25]]
+
+
+def format_tag_list_for_embed(tags: dict[str, str]) -> str:
+    if not tags:
+        return "No tags are saved yet."
+    lines = [f"`{name}` — {truncate(value, 140)}" for name, value in sorted(tags.items())]
+    text_value = "\n".join(lines)
+    return truncate(text_value, 4000)
+
+
 def get_notes_thread_id(bot: "TicketBot", guild_id: int, ticket_channel_id: int) -> Optional[int]:
     config = bot.config_store.get_guild(guild_id)
     mapping = config.get("notes_thread_ids", {})
@@ -930,21 +947,114 @@ async def get_notes_thread(
     bot: "TicketBot",
     guild: discord.Guild,
     channel: discord.TextChannel,
-) -> Optional[discord.Thread]:
-    thread_id = get_notes_thread_id(bot, guild.id, channel.id)
-    if not thread_id:
+) -> Optional[discord.abc.GuildChannel]:
+    notes_id = get_notes_thread_id(bot, guild.id, channel.id)
+    if not notes_id:
         return None
 
-    thread = guild.get_thread(thread_id)
+    thread = guild.get_thread(notes_id)
     if thread is not None:
         return thread
 
+    found = guild.get_channel(notes_id)
+    if found is not None:
+        return found
+
     try:
-        fetched = await bot.fetch_channel(thread_id)
+        fetched = await bot.fetch_channel(notes_id)
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         return None
 
-    return fetched if isinstance(fetched, discord.Thread) else None
+    if isinstance(fetched, (discord.Thread, discord.TextChannel)):
+        return fetched
+    return None
+
+
+async def ensure_notes_participant(notes_channel, member: discord.Member) -> None:
+    """If staff notes are a private thread, add the staff member to it."""
+    if isinstance(notes_channel, discord.Thread):
+        try:
+            await notes_channel.add_user(member)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+async def create_staff_notes_channel_fallback(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    ticket_channel: discord.TextChannel,
+    creator: discord.Member,
+) -> tuple[Optional[discord.TextChannel], str]:
+    """Create a hidden staff-only notes text channel if private threads are unavailable."""
+    owner_id = get_ticket_owner_id(ticket_channel)
+    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+
+    me = guild.me
+    if me is not None:
+        overwrites[me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            embed_links=True,
+            attach_files=True,
+        )
+
+    staff_roles: list[discord.Role] = []
+    for role in get_staff_roles(bot, guild) + get_priority_staff_roles(bot, guild):
+        if role not in staff_roles and not role.is_default():
+            staff_roles.append(role)
+
+    for role in staff_roles:
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_messages=True,
+            embed_links=True,
+            attach_files=True,
+        )
+
+    overwrites[creator] = discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        embed_links=True,
+        attach_files=True,
+    )
+
+    category = ticket_channel.category
+    ticket_number = get_ticket_number(ticket_channel)
+    name = f"notes-{ticket_number}-{ticket_channel.name}"[:95]
+    topic = f"staff_notes_for:{ticket_channel.id}|ticket_owner:{owner_id or 0}"
+
+    try:
+        notes_channel = await guild.create_text_channel(
+            name=name,
+            category=category,
+            overwrites=overwrites,
+            topic=topic,
+            reason=f"Staff notes fallback created by {creator} ({creator.id})",
+        )
+    except discord.Forbidden:
+        return None, (
+            "I could not create staff notes. I tried a private thread and a staff-only notes channel.\n\n"
+            "Give the bot **Create Private Threads**, **Send Messages in Threads**, **Manage Threads**, "
+            "and **Manage Channels** in the ticket category."
+        )
+    except discord.HTTPException as exc:
+        return None, f"Discord refused both staff-notes methods: `{exc}`"
+
+    set_notes_thread_id(bot, guild.id, ticket_channel.id, notes_channel.id)
+    await notes_channel.send(
+        "📝 **Staff Notes**\n"
+        f"Linked ticket: {ticket_channel.mention}\n"
+        "This is a staff-only fallback notes channel. These messages are appended to the ticket transcript when the ticket closes."
+    )
+    return notes_channel, "created_channel"
 
 
 async def create_or_get_notes_thread(
@@ -952,11 +1062,13 @@ async def create_or_get_notes_thread(
     guild: discord.Guild,
     channel: discord.TextChannel,
     creator: discord.Member,
-) -> tuple[Optional[discord.Thread], str]:
+) -> tuple[Optional[discord.abc.GuildChannel], str]:
     existing = await get_notes_thread(bot, guild, channel)
     if existing is not None:
+        await ensure_notes_participant(existing, creator)
         return existing, "existing"
 
+    private_thread_error = ""
     try:
         thread = await channel.create_thread(
             name=f"staff-notes-{channel.name}"[:100],
@@ -964,24 +1076,38 @@ async def create_or_get_notes_thread(
             invitable=False,
             reason=f"Staff notes created by {creator} ({creator.id})",
         )
-    except TypeError:
-        thread = await channel.create_thread(
-            name=f"staff-notes-{channel.name}"[:100],
-            type=discord.ChannelType.private_thread,
-            reason=f"Staff notes created by {creator} ({creator.id})",
+        await ensure_notes_participant(thread, creator)
+        set_notes_thread_id(bot, guild.id, channel.id, thread.id)
+        await thread.send(
+            "📝 **Staff Notes**\n"
+            "Use this private thread for internal discussion. These notes are appended to the ticket transcript when the ticket closes."
         )
-    except discord.Forbidden:
-        return None, "I could not create a private notes thread. Give me Manage Threads permission."
-    except discord.HTTPException:
-        return None, "Discord refused the notes thread request. This server may not support private threads here."
+        return thread, "created"
+    except TypeError:
+        try:
+            thread = await channel.create_thread(
+                name=f"staff-notes-{channel.name}"[:100],
+                type=discord.ChannelType.private_thread,
+                reason=f"Staff notes created by {creator} ({creator.id})",
+            )
+            await ensure_notes_participant(thread, creator)
+            set_notes_thread_id(bot, guild.id, channel.id, thread.id)
+            await thread.send(
+                "📝 **Staff Notes**\n"
+                "Use this private thread for internal discussion. These notes are appended to the ticket transcript when the ticket closes."
+            )
+            return thread, "created"
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            private_thread_error = str(exc)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        private_thread_error = str(exc)
 
-    set_notes_thread_id(bot, guild.id, channel.id, thread.id)
-
-    await thread.send(
-        "📝 **Staff Notes**\n"
-        "Use this private thread for internal discussion. These notes are appended to the ticket transcript when the ticket closes."
-    )
-    return thread, "created"
+    notes_channel, status = await create_staff_notes_channel_fallback(bot, guild, channel, creator)
+    if notes_channel is None:
+        if private_thread_error:
+            status += f"\nPrivate thread error: `{truncate(private_thread_error, 500)}`"
+        return None, status
+    return notes_channel, status
 
 async def create_ticket_channel(
     bot: "TicketBot",
@@ -1476,37 +1602,34 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         reason_text = str(self.reason.value).strip() or "No reason provided."
         await interaction.response.send_message("Closing the ticket and saving transcript...", ephemeral=True)
 
-        topic_data = parse_ticket_topic(self.channel.topic)
-        claimed_by = int(topic_data.get("claimed_by", "0") or 0)
+        claimed_by = get_claimed_by_id(self.channel) or 0
         ping_role_ids = get_ticket_ping_role_ids(self.channel)
         ticket_log_id = get_ticket_log_id(self.channel)
         ticket_number = get_ticket_number(self.channel)
         ticket_kind = get_ticket_kind(self.channel)
 
-        await update_ticket_metadata(
-            self.channel,
-            status="closed",
-            claimed_by=claimed_by,
-            ping_role_ids=ping_role_ids,
-            ticket_number=ticket_number,
-            ticket_type=ticket_kind,
-        )
+        try:
+            await update_ticket_metadata(
+                self.channel,
+                status="closed",
+                claimed_by=claimed_by,
+                ping_role_ids=ping_role_ids,
+                ticket_number=ticket_number,
+                ticket_type=ticket_kind,
+            )
+        except discord.HTTPException:
+            pass
 
         notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
         transcript_text = await build_ticket_and_notes_transcript_text(self.channel, notes_thread)
-        save_ticket_log_text(interaction.guild.id, ticket_log_id, transcript_text)
-        transcript = transcript_file_from_text(
-            transcript_text,
-            f"ticket-{ticket_number}-{ticket_log_id}-{self.channel.name}-transcript.txt",
-        )
+        try:
+            save_ticket_log_text(interaction.guild.id, ticket_log_id, transcript_text)
+        except OSError:
+            pass
 
         log_channel = await get_log_channel(self.bot, interaction.guild)
         closed_at = now_utc()
-        embed = discord.Embed(
-            title="Ticket Closed",
-            color=discord.Color.red(),
-            timestamp=closed_at,
-        )
+        embed = discord.Embed(title="Ticket Closed", color=discord.Color.red(), timestamp=closed_at)
         embed.add_field(name="Ticket Number", value=f"`{ticket_number}`", inline=True)
         embed.add_field(name="Ticket ID / Channel ID", value=f"`{ticket_log_id}`", inline=True)
         embed.add_field(name="Ticket Type", value=ticket_kind.title(), inline=True)
@@ -1515,18 +1638,65 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         embed.add_field(name="Closed By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="Close Reason", value=truncate(reason_text, 1024), inline=False)
         embed.add_field(name="Closed At", value=closed_at.strftime("%Y-%m-%d %H:%M:%S UTC"), inline=False)
-        if notes_thread is not None:
-            embed.add_field(name="Staff Notes", value=f"Included from {notes_thread.mention}", inline=False)
+        embed.add_field(name="Staff Notes", value=(f"Included from {notes_thread.mention}" if notes_thread is not None else "No staff notes were linked."), inline=False)
+        embed.set_footer(text="Transcript file includes ticket conversation and staff notes when available.")
+
+        log_sent = False
+        log_error = ""
+        if log_channel is None:
+            log_error = "No closed-ticket log channel is configured or the configured channel no longer exists."
         else:
-            embed.add_field(name="Staff Notes", value="No staff notes thread was linked.", inline=False)
-        embed.set_footer(text="Transcript file includes ticket conversation and staff notes.")
+            try:
+                transcript = transcript_file_from_text(
+                    transcript_text,
+                    f"ticket-{ticket_number}-{ticket_log_id}-{self.channel.name}-transcript.txt",
+                )
+                await log_channel.send(embed=embed, file=transcript)
+                log_sent = True
+            except discord.Forbidden:
+                log_error = f"I do not have permission to send embeds/files in {log_channel.mention}."
+            except discord.HTTPException as exc:
+                log_error = f"Discord rejected the ticket log message: `{truncate(str(exc), 500)}`"
 
-        if log_channel is not None:
-            await log_channel.send(embed=embed, file=transcript)
+        if not log_sent:
+            await interaction.followup.send(
+                "I could not send the transcript to the configured ticket log channel, so I am keeping this ticket open to prevent transcript loss.\n\n"
+                f"Reason: {log_error}\n\n"
+                "Fix the log channel permissions, then press **Close** again.",
+                ephemeral=True,
+            )
+            try:
+                await self.channel.send(
+                    f"⚠️ Ticket close was stopped because the transcript could not be posted to the log channel.\nReason: {log_error}"
+                )
+            except discord.HTTPException:
+                pass
+            return
 
-        await self.channel.send(f"🔒 Ticket closed by {interaction.user.mention}. Reason: {reason_text}")
+        try:
+            await self.channel.send(f"🔒 Ticket closed by {interaction.user.mention}. Reason: {reason_text}")
+        except discord.HTTPException:
+            pass
+
+        if isinstance(notes_thread, discord.TextChannel):
+            try:
+                await notes_thread.delete(reason=f"Ticket {self.channel.id} closed; staff notes transcript saved.")
+            except discord.HTTPException:
+                pass
+
         await asyncio.sleep(4)
-        await self.channel.delete(reason=f"Ticket closed by {interaction.user} ({interaction.user.id})")
+        try:
+            await self.channel.delete(reason=f"Ticket closed by {interaction.user} ({interaction.user.id})")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "The transcript was posted, but I could not delete the ticket channel. Give me **Manage Channels** in the ticket category.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"The transcript was posted, but Discord rejected the channel delete: `{truncate(str(exc), 500)}`",
+                ephemeral=True,
+            )
 
 
 class TicketOpenButton(discord.ui.Button):
@@ -1570,11 +1740,8 @@ class TicketPanelView(discord.ui.View):
 class TicketChannelView(discord.ui.View):
     """Public ticket controls.
 
-    The buttons are visible to everyone who can see the private ticket channel.
-    Permission checks happen inside each button:
-    - Ping Team: ticket owner or staff, with a 10-minute cooldown.
-    - Claim/Unclaim: staff only, and the ticket creator cannot claim/unclaim their own ticket.
-    - Close: public to users who can access the ticket channel.
+    Buttons are visible to everyone who can see the private ticket channel.
+    Permission checks happen inside each button.
     """
 
     def __init__(self, bot: "TicketBot"):
@@ -1718,91 +1885,6 @@ class TicketChannelView(discord.ui.View):
 
         await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
 
-
-class StaffTicketControlsView(discord.ui.View):
-    """Ephemeral staff-only controls for a ticket channel."""
-
-    def __init__(self, bot: "TicketBot"):
-        super().__init__(timeout=300)
-        self.bot = bot
-
-    async def _get_staff_ticket_channel(self, interaction: discord.Interaction) -> Optional[discord.TextChannel]:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
-            return None
-
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
-            return None
-
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can use these controls.", ephemeral=True)
-            return None
-
-        return channel
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, row=0)
-    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = await self._get_staff_ticket_channel(interaction)
-        if channel is None or interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            return
-
-        claimed_by = get_claimed_by_id(channel)
-        if claimed_by == interaction.user.id:
-            await interaction.response.send_message("You already claimed this ticket.", ephemeral=True)
-            return
-        if claimed_by is not None:
-            await interaction.response.send_message(
-                f"This ticket is already claimed by {format_user_reference(interaction.guild, claimed_by)}. It must be unclaimed first.",
-                ephemeral=True,
-            )
-            return
-
-        await update_ticket_metadata(channel, claimed_by=interaction.user.id)
-        await safe_edit_channel_name(
-            channel,
-            claimed_channel_name(interaction.user, channel),
-            reason=f"Ticket claimed by {interaction.user} ({interaction.user.id})",
-        )
-        await channel.send(f"📌 Ticket claimed by {interaction.user.mention} (`{interaction.user.id}`).")
-        await interaction.response.send_message("You claimed this ticket.", ephemeral=True)
-
-    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.secondary, row=0)
-    async def unclaim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = await self._get_staff_ticket_channel(interaction)
-        if channel is None or interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            return
-
-        claimed_by = get_claimed_by_id(channel)
-        if claimed_by is None:
-            await interaction.response.send_message("This ticket is not currently claimed.", ephemeral=True)
-            return
-
-        can_unclaim = claimed_by == interaction.user.id or interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_channels
-        if not can_unclaim:
-            await interaction.response.send_message(
-                f"Only the staff member who claimed this ticket or an admin can unclaim it. Claimed by: {format_user_reference(interaction.guild, claimed_by)}",
-                ephemeral=True,
-            )
-            return
-
-        await update_ticket_metadata(channel, claimed_by=0)
-        await safe_edit_channel_name(
-            channel,
-            ticket_base_channel_name(channel),
-            reason=f"Ticket unclaimed by {interaction.user} ({interaction.user.id})",
-        )
-        await channel.send(f"📌 Ticket unclaimed by {interaction.user.mention} (`{interaction.user.id}`).")
-        await interaction.response.send_message("You unclaimed this ticket.", ephemeral=True)
-
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=0)
-    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        channel = await self._get_staff_ticket_channel(interaction)
-        if channel is None:
-            return
-
-        await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
 
 class ConfigRoleSelect(discord.ui.Select):
     def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str, search_query: str = ""):
@@ -2008,7 +2090,145 @@ class TicketAdminPanelView(discord.ui.View):
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.edit_message(embed=embed, view=self)
 
-@app_commands.guild_only()
+
+class TagEditModal(discord.ui.Modal):
+    response = discord.ui.TextInput(label="Tag response", style=discord.TextStyle.paragraph, max_length=1900, required=True)
+
+    def __init__(self, bot: "TicketBot", tag_name: str, existing_response: str = ""):
+        super().__init__(title=f"Edit Tag: {tag_name}"[:45], timeout=300)
+        self.bot = bot
+        self.tag_name = clean_tag_name(tag_name)
+        self.response.default = existing_response[:1900]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can edit tags.", ephemeral=True)
+            return
+        set_tag(self.bot, interaction.guild.id, self.tag_name, str(self.response.value))
+        await interaction.response.send_message(f"Updated tag `{self.tag_name}`.", ephemeral=True)
+
+
+class TagCreateModal(discord.ui.Modal, title="Create Tag"):
+    name = discord.ui.TextInput(label="Tag name", placeholder="Example: rules, kits, payment, unlink", max_length=40, required=True)
+    response = discord.ui.TextInput(label="Tag response", style=discord.TextStyle.paragraph, max_length=1900, required=True)
+
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(timeout=300)
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can create tags.", ephemeral=True)
+            return
+        clean_name = clean_tag_name(str(self.name.value))
+        if not clean_name:
+            await interaction.response.send_message("Use a tag name with letters or numbers.", ephemeral=True)
+            return
+        set_tag(self.bot, interaction.guild.id, clean_name, str(self.response.value))
+        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can use `/ticket sendtag name:{clean_name}` inside tickets.", ephemeral=True)
+
+
+class TagSelect(discord.ui.Select):
+    def __init__(self, bot: "TicketBot", guild: discord.Guild, action: str):
+        self.bot = bot
+        self.action = action
+        tags = get_tags(bot, guild.id)
+        options: list[discord.SelectOption] = []
+        for name, response in sorted(tags.items())[:25]:
+            options.append(discord.SelectOption(label=name[:100], value=name, description=truncate(response, 90)))
+        if not options:
+            options.append(discord.SelectOption(label="No tags saved", value="__none__", description="Create a tag first."))
+        super().__init__(placeholder=f"Choose a tag to {action}...", min_values=1, max_values=1, options=options)
+        if not tags:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can manage tags.", ephemeral=True)
+            return
+        tag_name = clean_tag_name(self.values[0])
+        tags = get_tags(self.bot, interaction.guild.id)
+        if tag_name not in tags:
+            await interaction.response.send_message("That tag no longer exists.", ephemeral=True)
+            return
+        if self.action == "edit":
+            await interaction.response.send_modal(TagEditModal(self.bot, tag_name, tags[tag_name]))
+            return
+        remove_tag(self.bot, interaction.guild.id, tag_name)
+        await interaction.response.edit_message(content=f"Removed tag `{tag_name}`.", embed=build_tag_admin_embed(self.bot, interaction.guild), view=TagAdminView(self.bot))
+
+
+class TagSelectView(discord.ui.View):
+    def __init__(self, bot: "TicketBot", guild: discord.Guild, action: str):
+        super().__init__(timeout=300)
+        self.add_item(TagSelect(bot, guild, action))
+
+
+class TagAdminView(discord.ui.View):
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(timeout=600)
+        self.bot = bot
+
+    @discord.ui.button(label="Create Tag", style=discord.ButtonStyle.primary, row=0)
+    async def create_tag_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can create tags.", ephemeral=True)
+            return
+        await interaction.response.send_modal(TagCreateModal(self.bot))
+
+    @discord.ui.button(label="Edit Tag", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_tag_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can edit tags.", ephemeral=True)
+            return
+        await interaction.response.send_message("Choose a tag to edit:", view=TagSelectView(self.bot, interaction.guild, "edit"), ephemeral=True)
+
+    @discord.ui.button(label="Delete Tag", style=discord.ButtonStyle.danger, row=0)
+    async def delete_tag_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can delete tags.", ephemeral=True)
+            return
+        await interaction.response.send_message("Choose a tag to delete:", view=TagSelectView(self.bot, interaction.guild, "delete"), ephemeral=True)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=build_tag_admin_embed(self.bot, interaction.guild), view=TagAdminView(self.bot))
+
+
+def build_tag_admin_embed(bot: "TicketBot", guild: discord.Guild) -> discord.Embed:
+    tags = get_tags(bot, guild.id)
+    embed = discord.Embed(
+        title="Tag Admin Panel",
+        description=(
+            "Create, edit, and delete reusable staff tag responses.\n\n"
+            "Staff can send tags inside tickets with `/ticket sendtag`. "
+            "The tag name auto-populates from saved tags."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=now_utc(),
+    )
+    embed.add_field(name=f"Saved tags ({len(tags)})", value=format_tag_list_for_embed(tags), inline=False)
+    embed.set_footer(text="Discord dropdowns/autocomplete show up to 25 matches at a time.")
+    return embed
+
 @app_commands.guild_only()
 class TicketCommands(commands.GroupCog, group_name="ticket", group_description="Ticket bot commands"):
     def __init__(self, bot: "TicketBot"):
@@ -2194,29 +2414,45 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 ephemeral=True,
             )
 
+    async def tag_name_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        if interaction.guild is None:
+            return []
+        return tag_choices(self.bot, interaction.guild.id, current)
+
+    @app_commands.command(name="tagadmin", description="Open the tag admin panel.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def tag_admin_command(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=build_tag_admin_embed(self.bot, interaction.guild), view=TagAdminView(self.bot), ephemeral=True)
+
     @app_commands.command(name="settag", description="Create or update a reusable staff tag response.")
     @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /ticket tag")
+    @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /ticket sendtag")
+    @app_commands.autocomplete(name=tag_name_autocomplete)
     async def set_tag_command(self, interaction: discord.Interaction, name: str, response: str) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
-
         clean_name = clean_tag_name(name)
         if not clean_name:
             await interaction.response.send_message("Use a tag name with letters or numbers.", ephemeral=True)
             return
-
         set_tag(self.bot, interaction.guild.id, clean_name, response)
-        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can now use `/ticket tag name:{clean_name}` inside tickets.", ephemeral=True)
+        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can now use `/ticket sendtag name:{clean_name}` inside tickets.", ephemeral=True)
 
     @app_commands.command(name="removetag", description="Remove a reusable staff tag response.")
     @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.autocomplete(name=tag_name_autocomplete)
     async def remove_tag_command(self, interaction: discord.Interaction, name: str) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
-
         clean_name = clean_tag_name(name)
         existed = remove_tag(self.bot, interaction.guild.id, clean_name)
         if existed:
@@ -2230,36 +2466,38 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
-
         tags = get_tags(self.bot, interaction.guild.id)
         if not tags:
-            await interaction.response.send_message("No tags are saved yet. Use `/ticket settag` first.", ephemeral=True)
+            await interaction.response.send_message("No tags are saved yet. Use `/ticket tagadmin` or `/ticket settag` first.", ephemeral=True)
             return
+        await interaction.response.send_message("Saved tags:\n" + format_tag_list_for_embed(tags), ephemeral=True)
 
-        lines = [f"`{name}` — {truncate(value, 120)}" for name, value in sorted(tags.items())]
-        await interaction.response.send_message("Saved tags:\n" + "\n".join(lines), ephemeral=True)
+    @app_commands.command(name="sendtag", description="Send a saved staff tag response inside a ticket.")
+    @app_commands.autocomplete(name=tag_name_autocomplete)
+    async def send_tag_command(self, interaction: discord.Interaction, name: str) -> None:
+        await self._send_saved_tag(interaction, name)
 
     @app_commands.command(name="tag", description="Send a saved staff tag response inside a ticket.")
-    async def send_tag_command(self, interaction: discord.Interaction, name: str) -> None:
+    @app_commands.autocomplete(name=tag_name_autocomplete)
+    async def tag_alias_command(self, interaction: discord.Interaction, name: str) -> None:
+        await self._send_saved_tag(interaction, name)
+
+    async def _send_saved_tag(self, interaction: discord.Interaction, name: str) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
-
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("Use `/ticket tag` inside a ticket channel.", ephemeral=True)
+            await interaction.response.send_message("Use `/ticket sendtag` inside a ticket channel.", ephemeral=True)
             return
-
         if not member_is_staff(self.bot, interaction.user):
             await interaction.response.send_message("Only ticket staff can use saved tags.", ephemeral=True)
             return
-
         clean_name = clean_tag_name(name)
         response = get_tags(self.bot, interaction.guild.id).get(clean_name)
         if not response:
             await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/ticket tags` to view saved tags.", ephemeral=True)
             return
-
         await interaction.response.send_message(response, allowed_mentions=discord.AllowedMentions.none())
 
     @app_commands.command(name="notes", description="Create or open the staff-only notes thread for this ticket.")
@@ -2283,8 +2521,13 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.followup.send(status, ephemeral=True)
             return
 
-        msg = "Created" if status == "created" else "Opened existing"
-        await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
+        if status == "created_channel":
+            msg = "Created fallback staff notes channel"
+        elif status == "created":
+            msg = "Created private staff notes thread"
+        else:
+            msg = "Opened existing staff notes"
+        await interaction.followup.send(f"{msg}: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
 
     @app_commands.command(name="admin", description="Open the ticket admin control panel.")
     @app_commands.checks.has_permissions(administrator=True)
@@ -2325,7 +2568,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="Public ticket buttons: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket creators cannot claim/unclaim their own tickets. Use `/ticket notes` for staff notes.",
+            value="Public ticket buttons: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Claim/Unclaim are staff-only checks. Use `/ticket notes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
