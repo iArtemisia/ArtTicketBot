@@ -497,7 +497,30 @@ def get_config_roles(bot: "TicketBot", guild: discord.Guild, target: str) -> lis
     return get_roles_from_config(bot, guild, target)
 
 
-def get_selectable_roles(bot: "TicketBot", guild: discord.Guild, target: str, action: str) -> list[discord.Role]:
+def normalize_role_search_query(search_query: str) -> str:
+    return str(search_query or "").strip()[:100]
+
+
+def role_matches_search(role: discord.Role, search_query: str) -> bool:
+    query = normalize_role_search_query(search_query).lower()
+    if not query:
+        return True
+
+    # Allow searching by role name, partial role name, raw role ID, or role mention.
+    matching_ids = set(extract_ids(query))
+    if role.id in matching_ids:
+        return True
+
+    return query in role.name.lower() or query in str(role.id)
+
+
+def get_selectable_roles(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    target: str,
+    action: str,
+    search_query: str = "",
+) -> list[discord.Role]:
     normalized_target = normalize_role_target(target)
     configured = set(get_config_role_ids(bot, guild.id, normalized_target))
     roles = [role for role in guild.roles if not role.is_default() and not role.managed]
@@ -518,19 +541,29 @@ def get_selectable_roles(bot: "TicketBot", guild: discord.Guild, target: str, ac
         # Removal dropdowns always show currently configured roles so cleanup is possible.
         roles = [role for role in roles if role.id in configured]
 
-    return roles[:25]
+    clean_query = normalize_role_search_query(search_query)
+    if clean_query:
+        roles = [role for role in roles if role_matches_search(role, clean_query)]
 
+    return roles[:25]
 
 def format_role_list(roles: list[discord.Role]) -> str:
     return "\n".join(role.mention for role in roles) if roles else "None"
 
 
-def build_role_config_embed(bot: "TicketBot", guild: discord.Guild, target: str, action: str) -> discord.Embed:
+def build_role_config_embed(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    target: str,
+    action: str,
+    search_query: str = "",
+) -> discord.Embed:
     normalized_target = normalize_role_target(target)
     target_info = role_target_config(normalized_target)
     action_label = "Add" if action == "add" else "Remove"
     configured_roles = get_config_roles(bot, guild, normalized_target)
-    selectable_roles = get_selectable_roles(bot, guild, normalized_target, action)
+    clean_search_query = normalize_role_search_query(search_query)
+    selectable_roles = get_selectable_roles(bot, guild, normalized_target, action, clean_search_query)
     staff_filter_roles = get_staff_filter_roles(bot, guild)
 
     if normalized_target == "staff_pool":
@@ -563,6 +596,12 @@ def build_role_config_embed(bot: "TicketBot", guild: discord.Guild, target: str,
         timestamp=now_utc(),
     )
     embed.add_field(name=target_info["current_label"], value=format_role_list(configured_roles), inline=False)
+    if clean_search_query:
+        embed.add_field(
+            name="Current search",
+            value=f"`{truncate(clean_search_query, 90)}`",
+            inline=False,
+        )
 
     if normalized_target not in {"staff_pool", "priority_allowed"}:
         staff_filter_text = (
@@ -592,6 +631,9 @@ Priority Opener is intentionally not filtered to staff roles."
     elif normalized_target == "staff_pool":
         helper += "\
 This dropdown intentionally shows all non-managed server roles so you can build the staff filter."
+
+    if clean_search_query:
+        helper += f"\nSearch active: only roles matching `{truncate(clean_search_query, 60)}` are shown."
 
     embed.add_field(name="Dropdown status", value=f"{helper}\
 Available choices shown: {len(selectable_roles)} / 25 max.", inline=False)
@@ -1678,13 +1720,14 @@ class StaffTicketControlsView(discord.ui.View):
         await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
 
 class ConfigRoleSelect(discord.ui.Select):
-    def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str):
+    def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str, search_query: str = ""):
         self.bot = bot
         self.target = normalize_role_target(target)
         self.action = action
         self.guild_id = guild.id
+        self.search_query = normalize_role_search_query(search_query)
 
-        roles = get_selectable_roles(bot, guild, self.target, action)
+        roles = get_selectable_roles(bot, guild, self.target, action, self.search_query)
         options: list[discord.SelectOption] = []
         for role in roles:
             label = role.name[:100]
@@ -1696,8 +1739,12 @@ class ConfigRoleSelect(discord.ui.Select):
 
         target_info = role_target_config(self.target)
         action_label = "add" if action == "add" else "remove"
+        placeholder = f"Choose a role to {action_label}: {target_info['short']}..."
+        if self.search_query:
+            placeholder = f"Search `{self.search_query[:35]}` — choose a role..."
+
         super().__init__(
-            placeholder=f"Choose a role to {action_label}: {target_info['short']}...",
+            placeholder=placeholder[:150],
             min_values=1,
             max_values=1,
             options=options,
@@ -1728,21 +1775,63 @@ class ConfigRoleSelect(discord.ui.Select):
             remove_role_id_from_config(self.bot, interaction.guild.id, self.target, role.id)
             result = f"Removed {role.mention} from **{target_info['current_label']}**."
 
-        embed = build_role_config_embed(self.bot, interaction.guild, self.target, self.action)
+        embed = build_role_config_embed(self.bot, interaction.guild, self.target, self.action, self.search_query)
         embed.add_field(name="Updated", value=result, inline=False)
-        await interaction.response.edit_message(embed=embed, view=RoleConfigSelectView(self.bot, interaction.guild, self.target, self.action))
+        await interaction.response.edit_message(embed=embed, view=RoleConfigSelectView(self.bot, interaction.guild, self.target, self.action, self.search_query))
+
+
+class RoleSearchModal(discord.ui.Modal, title="Search Roles"):
+    search_input = discord.ui.TextInput(
+        label="Search role name, mention, or ID",
+        placeholder="Example: admin, moderator, VIP, Donator, 1234567890",
+        max_length=100,
+        required=False,
+    )
+
+    def __init__(self, bot: "TicketBot", target: str, action: str):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.target = normalize_role_target(target)
+        self.action = action
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can search ticket role settings.", ephemeral=True)
+            return
+
+        clean_query = normalize_role_search_query(str(self.search_input.value))
+        embed = build_role_config_embed(self.bot, interaction.guild, self.target, self.action, clean_query)
+        await interaction.response.edit_message(
+            embed=embed,
+            view=RoleConfigSelectView(self.bot, interaction.guild, self.target, self.action, clean_query),
+        )
 
 
 class RoleConfigSelectView(discord.ui.View):
-    def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str):
+    def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str, search_query: str = ""):
         super().__init__(timeout=300)
         self.bot = bot
         self.guild_id = guild.id
         self.target = normalize_role_target(target)
         self.action = action
-        self.add_item(ConfigRoleSelect(bot, guild, self.target, action))
+        self.search_query = normalize_role_search_query(search_query)
+        self.add_item(ConfigRoleSelect(bot, guild, self.target, action, self.search_query))
 
-    @discord.ui.button(label="Refresh List", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Search Roles", style=discord.ButtonStyle.secondary, row=1)
+    async def search_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can search ticket role settings.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RoleSearchModal(self.bot, self.target, self.action))
+
+    @discord.ui.button(label="Clear Search / Refresh", style=discord.ButtonStyle.primary, row=1)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
