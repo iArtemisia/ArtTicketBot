@@ -665,6 +665,7 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
     priority_staff_roles = get_roles_from_config(bot, guild, "priority_staff")
     priority_ping_roles = get_roles_from_config(bot, guild, "priority_ping")
     priority_allowed_roles = get_roles_from_config(bot, guild, "priority_allowed")
+    staff_filter_roles = get_staff_filter_roles(bot, guild)
 
     embed = discord.Embed(
         title="Ticket Admin Panel",
