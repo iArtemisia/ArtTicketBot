@@ -23,6 +23,7 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
+TICKET_STATS_PATH = Path(os.getenv("TICKET_STATS_PATH", str(CONFIG_PATH.parent / "ticket_stats.json")))
 TICKET_PING_COOLDOWN_SECONDS = 10 * 60
 
 TICKET_CONFIG: dict[str, str] = {
@@ -162,6 +163,240 @@ class GuildConfigStore:
         )
 
 
+class TicketStatsStore:
+    """Persistent per-guild ticket/staff statistics."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.write_text("{}", encoding="utf-8")
+
+    def _read_all(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _write_all(self, data: dict[str, Any]) -> None:
+        self.path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _get_guild(self, data: dict[str, Any], guild_id: int) -> dict[str, Any]:
+        guild_key = str(guild_id)
+        guild_data = data.setdefault(guild_key, {})
+        guild_data.setdefault("tickets", {})
+        return guild_data
+
+    def get_guild(self, guild_id: int) -> dict[str, Any]:
+        data = self._read_all()
+        return data.get(str(guild_id), {"tickets": {}})
+
+    def get_ticket(self, guild_id: int, channel_id: int) -> dict[str, Any]:
+        guild_data = self.get_guild(guild_id)
+        return guild_data.get("tickets", {}).get(str(channel_id), {})
+
+    def ensure_ticket(
+        self,
+        guild_id: int,
+        channel_id: int,
+        *,
+        ticket_number: str,
+        ticket_type: str,
+        opened_by: Optional[int] = None,
+        opened_at: Optional[str] = None,
+    ) -> dict[str, Any]:
+        data = self._read_all()
+        guild_data = self._get_guild(data, guild_id)
+        tickets = guild_data.setdefault("tickets", {})
+        ticket_key = str(channel_id)
+        ticket = tickets.setdefault(ticket_key, {})
+
+        ticket.setdefault("ticket_number", str(ticket_number))
+        ticket.setdefault("ticket_channel_id", int(channel_id))
+        ticket.setdefault("ticket_type", ticket_type or "normal")
+        ticket.setdefault("opened_by", int(opened_by) if opened_by else 0)
+        ticket.setdefault("opened_at", opened_at or now_utc().isoformat())
+        ticket.setdefault("claimed_by", 0)
+        ticket.setdefault("claimed_at", "")
+        ticket.setdefault("closed_by", 0)
+        ticket.setdefault("closed_at", "")
+        ticket.setdefault("close_reason", "")
+        ticket.setdefault("claim_events", [])
+        ticket.setdefault("unclaim_events", [])
+        ticket.setdefault("staff_messages", {})
+        ticket.setdefault("staff_message_last_at", {})
+
+        # Keep these values fresh if the channel was renamed/re-numbered after create.
+        ticket["ticket_number"] = str(ticket_number or ticket.get("ticket_number", ""))
+        ticket["ticket_channel_id"] = int(channel_id)
+        ticket["ticket_type"] = ticket_type or ticket.get("ticket_type", "normal")
+        if opened_by:
+            ticket["opened_by"] = int(opened_by)
+        if opened_at:
+            ticket["opened_at"] = opened_at
+
+        self._write_all(data)
+        return ticket
+
+    def ensure_ticket_from_channel(self, channel: discord.TextChannel) -> dict[str, Any]:
+        owner_id = get_ticket_owner_id(channel) or 0
+        opened_at = channel.created_at.isoformat() if channel.created_at else now_utc().isoformat()
+        return self.ensure_ticket(
+            channel.guild.id,
+            channel.id,
+            ticket_number=get_ticket_number(channel),
+            ticket_type=get_ticket_kind(channel),
+            opened_by=owner_id,
+            opened_at=opened_at,
+        )
+
+    def record_open(self, guild_id: int, channel_id: int, *, ticket_number: str, ticket_type: str, opened_by: int) -> None:
+        self.ensure_ticket(
+            guild_id,
+            channel_id,
+            ticket_number=ticket_number,
+            ticket_type=ticket_type,
+            opened_by=opened_by,
+            opened_at=now_utc().isoformat(),
+        )
+
+    def _mutate_ticket(self, guild_id: int, channel_id: int, callback) -> dict[str, Any]:
+        data = self._read_all()
+        guild_data = self._get_guild(data, guild_id)
+        tickets = guild_data.setdefault("tickets", {})
+        ticket = tickets.setdefault(str(channel_id), {})
+        ticket.setdefault("ticket_channel_id", int(channel_id))
+        ticket.setdefault("claim_events", [])
+        ticket.setdefault("unclaim_events", [])
+        ticket.setdefault("staff_messages", {})
+        ticket.setdefault("staff_message_last_at", {})
+        callback(ticket)
+        self._write_all(data)
+        return ticket
+
+    def record_claim(self, guild_id: int, channel_id: int, staff_id: int) -> None:
+        now_text = now_utc().isoformat()
+
+        def apply(ticket: dict[str, Any]) -> None:
+            ticket["claimed_by"] = int(staff_id)
+            ticket["claimed_at"] = now_text
+            events = ticket.setdefault("claim_events", [])
+            events.append({"staff_id": int(staff_id), "at": now_text})
+
+        self._mutate_ticket(guild_id, channel_id, apply)
+
+    def record_unclaim(self, guild_id: int, channel_id: int, staff_id: int) -> None:
+        now_text = now_utc().isoformat()
+
+        def apply(ticket: dict[str, Any]) -> None:
+            ticket["claimed_by"] = 0
+            ticket["claimed_at"] = ""
+            events = ticket.setdefault("unclaim_events", [])
+            events.append({"staff_id": int(staff_id), "at": now_text})
+
+        self._mutate_ticket(guild_id, channel_id, apply)
+
+    def record_staff_message(self, guild_id: int, channel_id: int, staff_id: int, created_at: Optional[datetime] = None) -> None:
+        now_text = (created_at or now_utc()).isoformat()
+
+        def apply(ticket: dict[str, Any]) -> None:
+            messages = ticket.setdefault("staff_messages", {})
+            key = str(staff_id)
+            messages[key] = int(messages.get(key, 0)) + 1
+            last = ticket.setdefault("staff_message_last_at", {})
+            last[key] = now_text
+
+        self._mutate_ticket(guild_id, channel_id, apply)
+
+    def record_close(self, guild_id: int, channel_id: int, staff_id: int, reason: str) -> None:
+        now_text = now_utc().isoformat()
+
+        def apply(ticket: dict[str, Any]) -> None:
+            ticket["closed_by"] = int(staff_id)
+            ticket["closed_at"] = now_text
+            ticket["close_reason"] = reason or "No reason provided."
+
+        self._mutate_ticket(guild_id, channel_id, apply)
+
+    def member_summary(self, guild_id: int, user_id: int) -> dict[str, Any]:
+        guild_data = self.get_guild(guild_id)
+        tickets = guild_data.get("tickets", {})
+        claimed_ticket_ids: set[str] = set()
+        closed_ticket_ids: set[str] = set()
+        typed_ticket_ids: set[str] = set()
+        total_messages = 0
+        recent: list[dict[str, Any]] = []
+        user_key = str(user_id)
+
+        for ticket_id, ticket in tickets.items():
+            claim_events = ticket.get("claim_events", []) if isinstance(ticket.get("claim_events"), list) else []
+            if str(ticket.get("claimed_by", "0")) == user_key or any(str(event.get("staff_id", "")) == user_key for event in claim_events):
+                claimed_ticket_ids.add(str(ticket_id))
+                event_times = [str(event.get("at", "")) for event in claim_events if str(event.get("staff_id", "")) == user_key]
+                recent.append({"action": "claimed", "ticket": ticket, "at": max(event_times) if event_times else str(ticket.get("claimed_at", ""))})
+
+            if str(ticket.get("closed_by", "0")) == user_key:
+                closed_ticket_ids.add(str(ticket_id))
+                recent.append({"action": "closed", "ticket": ticket, "at": str(ticket.get("closed_at", ""))})
+
+            messages = ticket.get("staff_messages", {}) if isinstance(ticket.get("staff_messages"), dict) else {}
+            count = int(messages.get(user_key, 0) or 0)
+            if count > 0:
+                typed_ticket_ids.add(str(ticket_id))
+                total_messages += count
+                last = ticket.get("staff_message_last_at", {}) if isinstance(ticket.get("staff_message_last_at"), dict) else {}
+                recent.append({"action": f"typed {count} message(s)", "ticket": ticket, "at": str(last.get(user_key, ""))})
+
+        recent = [item for item in recent if item.get("at")]
+        recent.sort(key=lambda item: str(item.get("at", "")), reverse=True)
+        return {
+            "claimed": len(claimed_ticket_ids),
+            "closed": len(closed_ticket_ids),
+            "typed": len(typed_ticket_ids),
+            "messages": total_messages,
+            "recent": recent[:10],
+        }
+
+    def leaderboard(self, guild_id: int) -> dict[str, dict[int, int]]:
+        guild_data = self.get_guild(guild_id)
+        tickets = guild_data.get("tickets", {})
+        claimed: dict[int, set[str]] = {}
+        closed: dict[int, int] = {}
+        messages: dict[int, int] = {}
+
+        for ticket_id, ticket in tickets.items():
+            claim_events = ticket.get("claim_events", []) if isinstance(ticket.get("claim_events"), list) else []
+            for event in claim_events:
+                try:
+                    staff_id = int(event.get("staff_id", 0))
+                except (TypeError, ValueError):
+                    staff_id = 0
+                if staff_id:
+                    claimed.setdefault(staff_id, set()).add(str(ticket_id))
+
+            try:
+                closed_by = int(ticket.get("closed_by", 0) or 0)
+            except (TypeError, ValueError):
+                closed_by = 0
+            if closed_by:
+                closed[closed_by] = closed.get(closed_by, 0) + 1
+
+            staff_messages = ticket.get("staff_messages", {}) if isinstance(ticket.get("staff_messages"), dict) else {}
+            for raw_id, count in staff_messages.items():
+                try:
+                    staff_id = int(raw_id)
+                    amount = int(count)
+                except (TypeError, ValueError):
+                    continue
+                messages[staff_id] = messages.get(staff_id, 0) + amount
+
+        return {
+            "claimed": {staff_id: len(ticket_ids) for staff_id, ticket_ids in claimed.items()},
+            "closed": closed,
+            "messages": messages,
+        }
+
+
 def slugify(value: str) -> str:
     value = value.lower().strip()
     value = re.sub(r"[^a-z0-9-]+", "-", value)
@@ -294,6 +529,77 @@ def format_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
     if member is not None:
         return f"{member.mention} (`{member.id}`)"
     return f"<@{user_id}> (`{user_id}`)"
+
+
+def format_stat_time(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "None"
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        return raw
+
+
+def format_staff_activity_summary(guild: discord.Guild, ticket: dict[str, Any]) -> str:
+    messages = ticket.get("staff_messages", {}) if isinstance(ticket.get("staff_messages"), dict) else {}
+    if not messages:
+        return "None"
+
+    lines: list[str] = []
+    for raw_id, count in sorted(messages.items(), key=lambda item: int(item[1] or 0), reverse=True):
+        try:
+            staff_id = int(raw_id)
+            amount = int(count)
+        except (TypeError, ValueError):
+            continue
+        member = guild.get_member(staff_id)
+        name = member.display_name if member is not None else f"User {staff_id}"
+        lines.append(f"- {name} ({staff_id}): {amount} message(s)")
+    return "\n".join(lines) if lines else "None"
+
+
+def build_ticket_audit_text(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> str:
+    ticket = bot.stats_store.get_ticket(guild.id, channel.id)
+    if not ticket:
+        bot.stats_store.ensure_ticket_from_channel(channel)
+        ticket = bot.stats_store.get_ticket(guild.id, channel.id)
+
+    lines = [
+        "================ TICKET AUDIT ================",
+        f"Ticket Number: {ticket.get('ticket_number') or get_ticket_number(channel)}",
+        f"Ticket Channel ID: {ticket.get('ticket_channel_id') or channel.id}",
+        f"Ticket Type: {str(ticket.get('ticket_type') or get_ticket_kind(channel)).title()}",
+        f"Opened By: {format_user_reference(guild, int(ticket.get('opened_by') or 0))}",
+        f"Claimed By: {format_user_reference(guild, int(ticket.get('claimed_by') or 0))}",
+        f"Closed By: {format_user_reference(guild, int(ticket.get('closed_by') or 0))}",
+        f"Opened At: {format_stat_time(ticket.get('opened_at'))}",
+        f"Claimed At: {format_stat_time(ticket.get('claimed_at'))}",
+        f"Closed At: {format_stat_time(ticket.get('closed_at'))}",
+        f"Close Reason: {ticket.get('close_reason') or 'None'}",
+        "",
+        "Staff Who Typed In Ticket:",
+        format_staff_activity_summary(guild, ticket),
+        "================================================",
+    ]
+    return "\n".join(lines)
+
+
+def build_staff_activity_embed_value(guild: discord.Guild, ticket: dict[str, Any]) -> str:
+    value = format_staff_activity_summary(guild, ticket)
+    return truncate(value, 1024)
+
+
+def format_leaderboard_section(guild: discord.Guild, data: dict[int, int]) -> str:
+    if not data:
+        return "None"
+    lines: list[str] = []
+    for index, (user_id, amount) in enumerate(sorted(data.items(), key=lambda item: item[1], reverse=True)[:10], start=1):
+        lines.append(f"`#{index}` {format_user_reference(guild, user_id)} — **{amount}**")
+    return "\n".join(lines)
 
 
 async def safe_edit_channel_name(channel: discord.TextChannel, name: str, *, reason: str) -> None:
@@ -911,7 +1217,8 @@ def transcript_file_from_text(text_value: str, filename: str) -> discord.File:
 
 async def build_ticket_and_notes_transcript_text(
     channel: discord.TextChannel,
-    notes_thread: Optional[discord.Thread] = None,
+    notes_thread: Optional[discord.abc.GuildChannel] = None,
+    audit_text: str = "",
 ) -> str:
     lines: list[str] = []
     lines.append(f"Transcript for #{channel.name}")
@@ -920,6 +1227,12 @@ async def build_ticket_and_notes_transcript_text(
     lines.append(f"Generated: {now_utc().isoformat()}")
     lines.append("=" * 70)
     lines.append("")
+
+    if audit_text:
+        lines.append(audit_text)
+        lines.append("")
+        lines.append("=" * 70)
+        lines.append("")
 
     await append_history_lines(lines, channel, label="TICKET CONVERSATION")
 
@@ -1260,6 +1573,14 @@ async def create_ticket_channel(
         return None, "I created the channel but couldn't post the starter message. Check the category/channel permissions."
     except discord.HTTPException:
         return None, "I created the channel but Discord rejected the starter message."
+
+    bot.stats_store.record_open(
+        guild.id,
+        channel.id,
+        ticket_number=ticket_number,
+        ticket_type=ticket_type,
+        opened_by=interaction.user.id,
+    )
 
     return channel, "created"
 
@@ -1624,13 +1945,17 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         except discord.HTTPException:
             pass
 
+        self.bot.stats_store.ensure_ticket_from_channel(self.channel)
+        self.bot.stats_store.record_close(interaction.guild.id, self.channel.id, interaction.user.id, reason_text)
         notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
-        transcript_text = await build_ticket_and_notes_transcript_text(self.channel, notes_thread)
+        audit_text = build_ticket_audit_text(self.bot, interaction.guild, self.channel)
+        transcript_text = await build_ticket_and_notes_transcript_text(self.channel, notes_thread, audit_text=audit_text)
         try:
             save_ticket_log_text(interaction.guild.id, ticket_log_id, transcript_text)
         except OSError:
             pass
 
+        ticket_stats = self.bot.stats_store.get_ticket(interaction.guild.id, self.channel.id)
         log_channel = await get_log_channel(self.bot, interaction.guild)
         closed_at = now_utc()
         embed = discord.Embed(title="Ticket Closed", color=discord.Color.red(), timestamp=closed_at)
@@ -1647,7 +1972,12 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             value=(f"Included from {notes_thread.mention}" if notes_thread is not None else "No staff notes were linked."),
             inline=False,
         )
-        embed.set_footer(text="Transcript file includes ticket conversation and staff notes when available.")
+        embed.add_field(
+            name="Staff Activity",
+            value=build_staff_activity_embed_value(interaction.guild, ticket_stats),
+            inline=False,
+        )
+        embed.set_footer(text="Transcript file includes ticket conversation, staff notes, and ticket audit stats when available.")
 
         log_sent = False
         log_error = ""
@@ -1834,6 +2164,8 @@ class TicketChannelView(discord.ui.View):
             return
 
         await update_ticket_metadata(channel, claimed_by=interaction.user.id)
+        self.bot.stats_store.ensure_ticket_from_channel(channel)
+        self.bot.stats_store.record_claim(interaction.guild.id, channel.id, interaction.user.id)
         await safe_edit_channel_name(
             channel,
             claimed_channel_name(interaction.user, channel),
@@ -1876,6 +2208,8 @@ class TicketChannelView(discord.ui.View):
             return
 
         await update_ticket_metadata(channel, claimed_by=0)
+        self.bot.stats_store.ensure_ticket_from_channel(channel)
+        self.bot.stats_store.record_unclaim(interaction.guild.id, channel.id, interaction.user.id)
         await safe_edit_channel_name(
             channel,
             ticket_base_channel_name(channel),
@@ -2688,6 +3022,64 @@ class TagCommands(commands.GroupCog, group_name="tag", group_description="Reusab
         await interaction.response.send_message(format_tag_list_for_embed(tags), ephemeral=True)
 
 
+@app_commands.guild_only()
+class StatsCommands(commands.GroupCog, group_name="stats", group_description="Ticket staff statistics"):
+    def __init__(self, bot: "TicketBot"):
+        self.bot = bot
+        super().__init__()
+
+    @app_commands.command(name="user", description="Show ticket stats for a staff member.")
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.describe(member="Staff member to check. Leave blank to check yourself.")
+    async def stats_user(self, interaction: discord.Interaction, member: Optional[discord.Member] = None) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        target = member or interaction.user
+        summary = self.bot.stats_store.member_summary(interaction.guild.id, target.id)
+        embed = discord.Embed(
+            title=f"Ticket Stats: {target.display_name}",
+            color=discord.Color.blurple(),
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="Tickets Claimed", value=str(summary["claimed"]), inline=True)
+        embed.add_field(name="Tickets Closed", value=str(summary["closed"]), inline=True)
+        embed.add_field(name="Tickets Typed In", value=str(summary["typed"]), inline=True)
+        embed.add_field(name="Staff Ticket Messages", value=str(summary["messages"]), inline=True)
+
+        recent_lines: list[str] = []
+        for item in summary["recent"][:5]:
+            ticket = item["ticket"]
+            ticket_number = ticket.get("ticket_number", "unknown")
+            ticket_type = str(ticket.get("ticket_type", "normal")).title()
+            recent_lines.append(
+                f"`{ticket_number}` ({ticket_type}) — {item['action']} — {format_stat_time(item.get('at'))}"
+            )
+        embed.add_field(name="Recent Ticket Activity", value="\n".join(recent_lines) if recent_lines else "None", inline=False)
+        embed.set_footer(text=f"User ID: {target.id}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="leaderboard", description="Show ticket staff leaderboard stats.")
+    @app_commands.default_permissions(manage_messages=True)
+    async def stats_leaderboard(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        board = self.bot.stats_store.leaderboard(interaction.guild.id)
+        embed = discord.Embed(
+            title="Ticket Staff Leaderboard",
+            description="Tracks claims, closes, and staff message counts from ticket channels.",
+            color=discord.Color.blurple(),
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="Most Tickets Claimed", value=format_leaderboard_section(interaction.guild, board["claimed"]), inline=False)
+        embed.add_field(name="Most Tickets Closed", value=format_leaderboard_section(interaction.guild, board["closed"]), inline=False)
+        embed.add_field(name="Most Ticket Messages", value=format_leaderboard_section(interaction.guild, board["messages"]), inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class TicketBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -2695,6 +3087,7 @@ class TicketBot(commands.Bot):
 
         super().__init__(command_prefix="!", intents=intents)
         self.config_store = GuildConfigStore(CONFIG_PATH)
+        self.stats_store = TicketStatsStore(TICKET_STATS_PATH)
         self.ticket_ping_cooldowns: dict[int, datetime] = {}
 
     async def setup_hook(self) -> None:
@@ -2702,12 +3095,26 @@ class TicketBot(commands.Bot):
         self.add_view(TicketChannelView(self))
         await self.add_cog(TicketCommands(self))
         await self.add_cog(TagCommands(self))
+        await self.add_cog(StatsCommands(self))
         await self.tree.sync()
 
     async def on_ready(self) -> None:
         if self.user is not None:
             print(f"Logged in as {self.user} (ID: {self.user.id})")
             print("------")
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.guild is None or message.author.bot:
+            await self.process_commands(message)
+            return
+
+        channel = message.channel
+        if isinstance(channel, discord.TextChannel) and is_ticket_channel(channel) and isinstance(message.author, discord.Member):
+            if member_is_staff(self, message.author):
+                self.stats_store.ensure_ticket_from_channel(channel)
+                self.stats_store.record_staff_message(message.guild.id, channel.id, message.author.id, message.created_at)
+
+        await self.process_commands(message)
 
 
 def main() -> None:
