@@ -677,12 +677,17 @@ def tag_choices(bot: "TicketBot", guild_id: int, current: str = "") -> list[app_
     return [app_commands.Choice(name=name, value=name) for name in names[:25]]
 
 
+async def saved_tag_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if interaction.guild is None or not isinstance(interaction.client, TicketBot):
+        return []
+    return tag_choices(interaction.client, interaction.guild.id, current)
+
+
 def format_tag_list_for_embed(tags: dict[str, str]) -> str:
     if not tags:
         return "No tags are saved yet."
     lines = [f"`{name}` — {truncate(value, 140)}" for name, value in sorted(tags.items())]
-    text_value = "\n".join(lines)
-    return truncate(text_value, 4000)
+    return truncate("\n".join(lines), 4000)
 
 
 def get_notes_thread_id(bot: "TicketBot", guild_id: int, ticket_channel_id: int) -> Optional[int]:
@@ -1500,10 +1505,6 @@ class AdminRoleConfigModal(discord.ui.Modal):
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
             return
 
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can edit default ticket roles.", ephemeral=True)
-            return
-
         role_ids = extract_ids(str(self.roles_input.value))
         roles: list[discord.Role] = []
         for role_id in role_ids:
@@ -1554,10 +1555,6 @@ class AdminPanelGifModal(discord.ui.Modal, title="Set Panel GIF or Image"):
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
             return
 
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can edit the panel image.", ephemeral=True)
-            return
-
         cleaned = normalize_panel_image_url(str(self.image_input.value))
         current = self.bot.config_store.get_guild(interaction.guild.id)
         self.bot.config_store.update_guild(
@@ -1599,6 +1596,13 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             await interaction.response.send_message("This does not look like a valid ticket channel.", ephemeral=True)
             return
 
+        if interaction.user.id != owner_id and not member_is_staff(self.bot, interaction.user):
+            await interaction.response.send_message(
+                "Only the ticket owner or ticket staff can close this ticket.",
+                ephemeral=True,
+            )
+            return
+
         reason_text = str(self.reason.value).strip() or "No reason provided."
         await interaction.response.send_message("Closing the ticket and saving transcript...", ephemeral=True)
 
@@ -1638,7 +1642,11 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         embed.add_field(name="Closed By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="Close Reason", value=truncate(reason_text, 1024), inline=False)
         embed.add_field(name="Closed At", value=closed_at.strftime("%Y-%m-%d %H:%M:%S UTC"), inline=False)
-        embed.add_field(name="Staff Notes", value=(f"Included from {notes_thread.mention}" if notes_thread is not None else "No staff notes were linked."), inline=False)
+        embed.add_field(
+            name="Staff Notes",
+            value=(f"Included from {notes_thread.mention}" if notes_thread is not None else "No staff notes were linked."),
+            inline=False,
+        )
         embed.set_footer(text="Transcript file includes ticket conversation and staff notes when available.")
 
         log_sent = False
@@ -1885,7 +1893,6 @@ class TicketChannelView(discord.ui.View):
 
         await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
 
-
 class ConfigRoleSelect(discord.ui.Select):
     def __init__(self, bot: "TicketBot", guild: discord.Guild, target: str, action: str, search_query: str = ""):
         self.bot = bot
@@ -1922,10 +1929,6 @@ class ConfigRoleSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can edit ticket role settings.", ephemeral=True)
             return
 
         role_id = int(self.values[0])
@@ -1966,9 +1969,6 @@ class RoleSearchModal(discord.ui.Modal, title="Search Roles"):
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
             return
 
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can search ticket role settings.", ephemeral=True)
-            return
 
         clean_query = normalize_role_search_query(str(self.search_input.value))
         embed = build_role_config_embed(self.bot, interaction.guild, self.target, self.action, clean_query)
@@ -1993,9 +1993,6 @@ class RoleConfigSelectView(discord.ui.View):
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
             return
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can search ticket role settings.", ephemeral=True)
-            return
         await interaction.response.send_modal(RoleSearchModal(self.bot, self.target, self.action))
 
     @discord.ui.button(label="Clear Search / Refresh", style=discord.ButtonStyle.primary, row=1)
@@ -2010,10 +2007,6 @@ class RoleConfigSelectView(discord.ui.View):
 async def send_role_config_panel(interaction: discord.Interaction, bot: "TicketBot", target: str, action: str) -> None:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-        return
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Only admins can edit ticket role settings.", ephemeral=True)
         return
 
     normalized_target = normalize_role_target(target)
@@ -2090,145 +2083,6 @@ class TicketAdminPanelView(discord.ui.View):
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.edit_message(embed=embed, view=self)
 
-
-class TagEditModal(discord.ui.Modal):
-    response = discord.ui.TextInput(label="Tag response", style=discord.TextStyle.paragraph, max_length=1900, required=True)
-
-    def __init__(self, bot: "TicketBot", tag_name: str, existing_response: str = ""):
-        super().__init__(title=f"Edit Tag: {tag_name}"[:45], timeout=300)
-        self.bot = bot
-        self.tag_name = clean_tag_name(tag_name)
-        self.response.default = existing_response[:1900]
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can edit tags.", ephemeral=True)
-            return
-        set_tag(self.bot, interaction.guild.id, self.tag_name, str(self.response.value))
-        await interaction.response.send_message(f"Updated tag `{self.tag_name}`.", ephemeral=True)
-
-
-class TagCreateModal(discord.ui.Modal, title="Create Tag"):
-    name = discord.ui.TextInput(label="Tag name", placeholder="Example: rules, kits, payment, unlink", max_length=40, required=True)
-    response = discord.ui.TextInput(label="Tag response", style=discord.TextStyle.paragraph, max_length=1900, required=True)
-
-    def __init__(self, bot: "TicketBot"):
-        super().__init__(timeout=300)
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can create tags.", ephemeral=True)
-            return
-        clean_name = clean_tag_name(str(self.name.value))
-        if not clean_name:
-            await interaction.response.send_message("Use a tag name with letters or numbers.", ephemeral=True)
-            return
-        set_tag(self.bot, interaction.guild.id, clean_name, str(self.response.value))
-        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can use `/ticket sendtag name:{clean_name}` inside tickets.", ephemeral=True)
-
-
-class TagSelect(discord.ui.Select):
-    def __init__(self, bot: "TicketBot", guild: discord.Guild, action: str):
-        self.bot = bot
-        self.action = action
-        tags = get_tags(bot, guild.id)
-        options: list[discord.SelectOption] = []
-        for name, response in sorted(tags.items())[:25]:
-            options.append(discord.SelectOption(label=name[:100], value=name, description=truncate(response, 90)))
-        if not options:
-            options.append(discord.SelectOption(label="No tags saved", value="__none__", description="Create a tag first."))
-        super().__init__(placeholder=f"Choose a tag to {action}...", min_values=1, max_values=1, options=options)
-        if not tags:
-            self.disabled = True
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can manage tags.", ephemeral=True)
-            return
-        tag_name = clean_tag_name(self.values[0])
-        tags = get_tags(self.bot, interaction.guild.id)
-        if tag_name not in tags:
-            await interaction.response.send_message("That tag no longer exists.", ephemeral=True)
-            return
-        if self.action == "edit":
-            await interaction.response.send_modal(TagEditModal(self.bot, tag_name, tags[tag_name]))
-            return
-        remove_tag(self.bot, interaction.guild.id, tag_name)
-        await interaction.response.edit_message(content=f"Removed tag `{tag_name}`.", embed=build_tag_admin_embed(self.bot, interaction.guild), view=TagAdminView(self.bot))
-
-
-class TagSelectView(discord.ui.View):
-    def __init__(self, bot: "TicketBot", guild: discord.Guild, action: str):
-        super().__init__(timeout=300)
-        self.add_item(TagSelect(bot, guild, action))
-
-
-class TagAdminView(discord.ui.View):
-    def __init__(self, bot: "TicketBot"):
-        super().__init__(timeout=600)
-        self.bot = bot
-
-    @discord.ui.button(label="Create Tag", style=discord.ButtonStyle.primary, row=0)
-    async def create_tag_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can create tags.", ephemeral=True)
-            return
-        await interaction.response.send_modal(TagCreateModal(self.bot))
-
-    @discord.ui.button(label="Edit Tag", style=discord.ButtonStyle.secondary, row=0)
-    async def edit_tag_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can edit tags.", ephemeral=True)
-            return
-        await interaction.response.send_message("Choose a tag to edit:", view=TagSelectView(self.bot, interaction.guild, "edit"), ephemeral=True)
-
-    @discord.ui.button(label="Delete Tag", style=discord.ButtonStyle.danger, row=0)
-    async def delete_tag_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can delete tags.", ephemeral=True)
-            return
-        await interaction.response.send_message("Choose a tag to delete:", view=TagSelectView(self.bot, interaction.guild, "delete"), ephemeral=True)
-
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=1)
-    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
-            return
-        await interaction.response.edit_message(embed=build_tag_admin_embed(self.bot, interaction.guild), view=TagAdminView(self.bot))
-
-
-def build_tag_admin_embed(bot: "TicketBot", guild: discord.Guild) -> discord.Embed:
-    tags = get_tags(bot, guild.id)
-    embed = discord.Embed(
-        title="Tag Admin Panel",
-        description=(
-            "Create, edit, and delete reusable staff tag responses.\n\n"
-            "Staff can send tags inside tickets with `/ticket sendtag`. "
-            "The tag name auto-populates from saved tags."
-        ),
-        color=discord.Color.blurple(),
-        timestamp=now_utc(),
-    )
-    embed.add_field(name=f"Saved tags ({len(tags)})", value=format_tag_list_for_embed(tags), inline=False)
-    embed.set_footer(text="Discord dropdowns/autocomplete show up to 25 matches at a time.")
-    return embed
-
 @app_commands.guild_only()
 class TicketCommands(commands.GroupCog, group_name="ticket", group_description="Ticket bot commands"):
     def __init__(self, bot: "TicketBot"):
@@ -2236,7 +2090,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         super().__init__()
 
     @app_commands.command(name="setup", description="Set the ticket category and closed-ticket log channel for this server.")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         category="Category where private ticket channels will be created",
         log_channel="Text channel where CLOSED ticket logs and transcript files will be sent",
@@ -2318,7 +2172,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
 
     @app_commands.command(name="addstaff", description="Add a normal ticket access role.")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def add_staff(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2331,7 +2185,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
 
     @app_commands.command(name="removestaff", description="Remove a normal ticket access role.")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def remove_staff(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2344,7 +2198,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
 
     @app_commands.command(name="addpingrole", description="Add a normal ticket ping role.")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def add_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2357,7 +2211,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
 
     @app_commands.command(name="removepingrole", description="Remove a normal ticket ping role.")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def remove_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2370,7 +2224,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         )
 
     @app_commands.command(name="panelgif", description="Set or clear the GIF/image shown on the ticket panel.")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         image_url="Direct image URL. Imgur page URLs are also accepted. Leave blank to clear.",
         image_file="Upload a GIF/image directly to use on the panel.",
@@ -2414,45 +2268,29 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 ephemeral=True,
             )
 
-    async def tag_name_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        if interaction.guild is None:
-            return []
-        return tag_choices(self.bot, interaction.guild.id, current)
-
-    @app_commands.command(name="tagadmin", description="Open the tag admin panel.")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def tag_admin_command(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-            return
-        await interaction.response.send_message(embed=build_tag_admin_embed(self.bot, interaction.guild), view=TagAdminView(self.bot), ephemeral=True)
-
     @app_commands.command(name="settag", description="Create or update a reusable staff tag response.")
-    @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /ticket sendtag")
-    @app_commands.autocomplete(name=tag_name_autocomplete)
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /ticket tag")
     async def set_tag_command(self, interaction: discord.Interaction, name: str, response: str) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
+
         clean_name = clean_tag_name(name)
         if not clean_name:
             await interaction.response.send_message("Use a tag name with letters or numbers.", ephemeral=True)
             return
+
         set_tag(self.bot, interaction.guild.id, clean_name, response)
-        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can now use `/ticket sendtag name:{clean_name}` inside tickets.", ephemeral=True)
+        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can now use `/tag send name:{clean_name}` inside tickets.", ephemeral=True)
 
     @app_commands.command(name="removetag", description="Remove a reusable staff tag response.")
-    @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.autocomplete(name=tag_name_autocomplete)
+    @app_commands.default_permissions(manage_guild=True)
     async def remove_tag_command(self, interaction: discord.Interaction, name: str) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
+
         clean_name = clean_tag_name(name)
         existed = remove_tag(self.bot, interaction.guild.id, clean_name)
         if existed:
@@ -2461,46 +2299,43 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.response.send_message(f"No tag named `{clean_name}` was found.", ephemeral=True)
 
     @app_commands.command(name="tags", description="List saved staff tag responses for this server.")
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @app_commands.default_permissions(manage_messages=True)
     async def list_tags_command(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
+
         tags = get_tags(self.bot, interaction.guild.id)
         if not tags:
-            await interaction.response.send_message("No tags are saved yet. Use `/ticket tagadmin` or `/ticket settag` first.", ephemeral=True)
+            await interaction.response.send_message("No tags are saved yet. Use `/tag admin` first.", ephemeral=True)
             return
-        await interaction.response.send_message("Saved tags:\n" + format_tag_list_for_embed(tags), ephemeral=True)
 
-    @app_commands.command(name="sendtag", description="Send a saved staff tag response inside a ticket.")
-    @app_commands.autocomplete(name=tag_name_autocomplete)
-    async def send_tag_command(self, interaction: discord.Interaction, name: str) -> None:
-        await self._send_saved_tag(interaction, name)
+        lines = [f"`{name}` — {truncate(value, 120)}" for name, value in sorted(tags.items())]
+        await interaction.response.send_message("Saved tags:\n" + "\n".join(lines), ephemeral=True)
 
     @app_commands.command(name="tag", description="Send a saved staff tag response inside a ticket.")
-    @app_commands.autocomplete(name=tag_name_autocomplete)
-    async def tag_alias_command(self, interaction: discord.Interaction, name: str) -> None:
-        await self._send_saved_tag(interaction, name)
-
-    async def _send_saved_tag(self, interaction: discord.Interaction, name: str) -> None:
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.autocomplete(name=saved_tag_autocomplete)
+    async def send_tag_command(self, interaction: discord.Interaction, name: str) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
             return
+
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("Use `/ticket sendtag` inside a ticket channel.", ephemeral=True)
+            await interaction.response.send_message("Use `/tag send` inside a ticket channel.", ephemeral=True)
             return
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can use saved tags.", ephemeral=True)
-            return
+
         clean_name = clean_tag_name(name)
         response = get_tags(self.bot, interaction.guild.id).get(clean_name)
         if not response:
-            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/ticket tags` to view saved tags.", ephemeral=True)
+            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/tag list` to view saved tags.", ephemeral=True)
             return
+
         await interaction.response.send_message(response, allowed_mentions=discord.AllowedMentions.none())
 
     @app_commands.command(name="notes", description="Create or open the staff-only notes thread for this ticket.")
+    @app_commands.default_permissions(manage_messages=True)
     async def ticket_notes(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2511,26 +2346,17 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.response.send_message("Use `/ticket notes` inside a ticket channel.", ephemeral=True)
             return
 
-        if not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message("Only ticket staff can open staff notes.", ephemeral=True)
-            return
-
         await interaction.response.defer(ephemeral=True, thinking=True)
         thread, status = await create_or_get_notes_thread(self.bot, interaction.guild, channel, interaction.user)
         if thread is None:
             await interaction.followup.send(status, ephemeral=True)
             return
 
-        if status == "created_channel":
-            msg = "Created fallback staff notes channel"
-        elif status == "created":
-            msg = "Created private staff notes thread"
-        else:
-            msg = "Opened existing staff notes"
-        await interaction.followup.send(f"{msg}: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
+        msg = "Created" if status == "created" else "Opened existing"
+        await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
 
     @app_commands.command(name="admin", description="Open the ticket admin control panel.")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def ticket_admin(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2540,7 +2366,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         await interaction.response.send_message(embed=embed, view=TicketAdminPanelView(self.bot), ephemeral=True)
 
     @app_commands.command(name="config", description="Show the ticket configuration for this server.")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def show_config(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2568,7 +2394,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="Public ticket buttons: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Claim/Unclaim are staff-only checks. Use `/ticket notes` for staff notes.",
+            value="Ticket buttons shown in the private ticket: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket owners cannot claim or unclaim their own tickets. Use `/ticket notes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
@@ -2576,7 +2402,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="panel", description="Post the ticket panel in the current channel.")
-    @app_commands.checks.has_permissions(manage_channels=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def ticket_panel(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2639,6 +2465,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         await interaction.followup.send(embed=embed, view=TicketPanelView(self.bot))
 
     @app_commands.command(name="ping", description="Check if the ticket bot is online.")
+    @app_commands.default_permissions(send_messages=True)
     async def ticket_ping(self, interaction: discord.Interaction) -> None:
         latency_ms = round(self.bot.latency * 1000)
         await interaction.response.send_message(f"Pong. Bot latency: {latency_ms} ms", ephemeral=True)
@@ -2662,6 +2489,205 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.response.send_message(message, ephemeral=True)
 
 
+class TagCreateModal(discord.ui.Modal, title="Create Tag"):
+    name_input = discord.ui.TextInput(
+        label="Tag name",
+        placeholder="Example: rules, payment, unlink",
+        max_length=40,
+    )
+    response_input = discord.ui.TextInput(
+        label="Tag response",
+        placeholder="Message to send when staff uses /tag send",
+        style=discord.TextStyle.paragraph,
+        max_length=1900,
+    )
+
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(timeout=300)
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        clean_name = clean_tag_name(str(self.name_input.value))
+        if not clean_name:
+            await interaction.response.send_message("Use a tag name with letters or numbers.", ephemeral=True)
+            return
+        set_tag(self.bot, interaction.guild.id, clean_name, str(self.response_input.value))
+        await interaction.response.send_message(f"Saved tag `{clean_name}`.", ephemeral=True)
+
+
+class TagEditModal(discord.ui.Modal, title="Edit Tag"):
+    response_input = discord.ui.TextInput(
+        label="New tag response",
+        style=discord.TextStyle.paragraph,
+        max_length=1900,
+    )
+
+    def __init__(self, bot: "TicketBot", tag_name: str, current_response: str):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.tag_name = clean_tag_name(tag_name)
+        self.response_input.default = current_response[:1900]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        set_tag(self.bot, interaction.guild.id, self.tag_name, str(self.response_input.value))
+        await interaction.response.send_message(f"Updated tag `{self.tag_name}`.", ephemeral=True)
+
+
+class TagSelect(discord.ui.Select):
+    def __init__(self, bot: "TicketBot", guild_id: int, mode: str):
+        self.bot = bot
+        self.guild_id = guild_id
+        self.mode = mode
+        tags = get_tags(bot, guild_id)
+        options = [
+            discord.SelectOption(label=name[:100], value=name, description=truncate(value, 90))
+            for name, value in sorted(tags.items())[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="No tags saved", value="0", description="Create a tag first.")]
+        super().__init__(placeholder=f"Choose a tag to {mode}...", min_values=1, max_values=1, options=options)
+        if not tags:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        if self.values[0] == "0":
+            await interaction.response.send_message("No tags are saved yet.", ephemeral=True)
+            return
+        tag_name = clean_tag_name(self.values[0])
+        tags = get_tags(self.bot, interaction.guild.id)
+        if tag_name not in tags:
+            await interaction.response.send_message(f"No tag named `{tag_name}` was found.", ephemeral=True)
+            return
+        if self.mode == "edit":
+            await interaction.response.send_modal(TagEditModal(self.bot, tag_name, tags[tag_name]))
+            return
+        existed = remove_tag(self.bot, interaction.guild.id, tag_name)
+        if existed:
+            await interaction.response.edit_message(
+                embed=build_tag_admin_embed(self.bot, interaction.guild),
+                view=TagAdminPanelView(self.bot),
+            )
+            await interaction.followup.send(f"Deleted tag `{tag_name}`.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"No tag named `{tag_name}` was found.", ephemeral=True)
+
+
+class TagSelectView(discord.ui.View):
+    def __init__(self, bot: "TicketBot", guild_id: int, mode: str):
+        super().__init__(timeout=300)
+        self.add_item(TagSelect(bot, guild_id, mode))
+
+
+def build_tag_admin_embed(bot: "TicketBot", guild: discord.Guild) -> discord.Embed:
+    tags = get_tags(bot, guild.id)
+    embed = discord.Embed(
+        title="Tag Admin Panel",
+        description=(
+            "Create, edit, or delete reusable ticket responses.\n\n"
+            "Use `/tag send` inside a ticket to send one of these saved responses."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Saved tags", value=format_tag_list_for_embed(tags), inline=False)
+    embed.set_footer(text="Tag commands can be managed from Discord Server Settings > Integrations.")
+    return embed
+
+
+class TagAdminPanelView(discord.ui.View):
+    def __init__(self, bot: "TicketBot"):
+        super().__init__(timeout=600)
+        self.bot = bot
+
+    @discord.ui.button(label="Create Tag", style=discord.ButtonStyle.success, row=0)
+    async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(TagCreateModal(self.bot))
+
+    @discord.ui.button(label="Edit Tag", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Choose the tag you want to edit.",
+            view=TagSelectView(self.bot, interaction.guild.id, "edit"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Delete Tag", style=discord.ButtonStyle.danger, row=0)
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Choose the tag you want to delete.",
+            view=TagSelectView(self.bot, interaction.guild.id, "delete"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=build_tag_admin_embed(self.bot, interaction.guild), view=self)
+
+
+@app_commands.guild_only()
+class TagCommands(commands.GroupCog, group_name="tag", group_description="Reusable ticket tag responses"):
+    def __init__(self, bot: "TicketBot"):
+        self.bot = bot
+        super().__init__()
+
+    @app_commands.command(name="admin", description="Open the tag admin panel.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def tag_admin(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=build_tag_admin_embed(self.bot, interaction.guild),
+            view=TagAdminPanelView(self.bot),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="send", description="Send a saved tag response inside a ticket.")
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.autocomplete(name=saved_tag_autocomplete)
+    async def tag_send(self, interaction: discord.Interaction, name: str) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.response.send_message("Use `/tag send` inside a ticket channel.", ephemeral=True)
+            return
+        clean_name = clean_tag_name(name)
+        response = get_tags(self.bot, interaction.guild.id).get(clean_name)
+        if not response:
+            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/tag list` to view saved tags.", ephemeral=True)
+            return
+        await interaction.response.send_message(response, allowed_mentions=discord.AllowedMentions.none())
+
+    @app_commands.command(name="list", description="List saved tag responses for this server.")
+    @app_commands.default_permissions(manage_messages=True)
+    async def tag_list(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+        tags = get_tags(self.bot, interaction.guild.id)
+        await interaction.response.send_message(format_tag_list_for_embed(tags), ephemeral=True)
+
+
 class TicketBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -2675,6 +2701,7 @@ class TicketBot(commands.Bot):
         self.add_view(TicketPanelView(self))
         self.add_view(TicketChannelView(self))
         await self.add_cog(TicketCommands(self))
+        await self.add_cog(TagCommands(self))
         await self.tree.sync()
 
     async def on_ready(self) -> None:
