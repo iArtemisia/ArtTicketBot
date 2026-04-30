@@ -124,6 +124,31 @@ class GuildConfigStore:
         self.set_guild(guild_id, config)
         return config
 
+    def format_ticket_number(self, value: int) -> str:
+        """Format ticket numbers as 000, 001, 002, ... 010, ... 1000."""
+        return f"{max(0, int(value)):03d}"
+
+    def peek_next_ticket_number(self, guild_id: int) -> str:
+        config = self.get_guild(guild_id)
+        try:
+            next_value = int(config.get("next_ticket_number", 0) or 0)
+        except (TypeError, ValueError):
+            next_value = 0
+        return self.format_ticket_number(next_value)
+
+    def allocate_ticket_number(self, guild_id: int) -> str:
+        """Return the next sequential ticket number and save the next counter value."""
+        config = self.get_guild(guild_id)
+        try:
+            next_value = int(config.get("next_ticket_number", 0) or 0)
+        except (TypeError, ValueError):
+            next_value = 0
+
+        ticket_number = self.format_ticket_number(next_value)
+        config["next_ticket_number"] = next_value + 1
+        self.set_guild(guild_id, config)
+        return ticket_number
+
     def add_staff_role(self, guild_id: int, role_id: int) -> dict[str, Any]:
         config = self.get_guild(guild_id)
         staff_role_ids = config.get("staff_role_ids", [])
@@ -1048,6 +1073,7 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
     )
     embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
     embed.add_field(name="Closed-ticket log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
+    embed.add_field(name="Next ticket number", value=f"`{bot.config_store.peek_next_ticket_number(guild.id)}`", inline=False)
     embed.add_field(
         name="Staff role dropdown filter",
         value=format_role_list(staff_filter_roles) if staff_filter_roles else "Not set — staff-facing dropdowns currently show all non-managed server roles.",
@@ -1455,8 +1481,8 @@ async def create_ticket_channel(
     guild = interaction.guild
     ticket_type = "priority" if priority else "normal"
     channel_prefix = PRIORITY_TICKET_CONFIG["channel_prefix"] if priority else TICKET_CONFIG["channel_prefix"]
-    temporary_number = str(interaction.user.id)[-4:]
-    channel_name = f"{channel_prefix}-{temporary_number}"[:95]
+    ticket_number = bot.config_store.allocate_ticket_number(guild.id)
+    channel_name = f"{channel_prefix}-{ticket_number}"[:95]
 
     if priority:
         visible_roles = get_priority_staff_roles(bot, guild)
@@ -1508,7 +1534,7 @@ async def create_ticket_channel(
             topic=build_ticket_topic(
                 owner_id=interaction.user.id,
                 ticket_type=ticket_type,
-                ticket_number=temporary_number,
+                ticket_number=ticket_number,
                 ping_role_ids=ping_role_ids,
             ),
             overwrites=overwrites,
@@ -1525,7 +1551,6 @@ async def create_ticket_channel(
     except discord.HTTPException:
         return None, "Discord refused the ticket channel create request. Try again in a moment."
 
-    ticket_number = str(channel.id)[-4:]
     await update_ticket_metadata(
         channel,
         ticket_number=ticket_number,
@@ -2714,6 +2739,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed = discord.Embed(title="Ticket Configuration", color=discord.Color.blurple())
         embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
         embed.add_field(name="Closed-ticket log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
+        embed.add_field(name="Next ticket number", value=f"`{self.bot.config_store.peek_next_ticket_number(interaction.guild.id)}`", inline=False)
         embed.add_field(name="Staff role dropdown filter", value=format_role_list(get_staff_filter_roles(self.bot, interaction.guild)), inline=False)
         embed.add_field(name="Normal access roles", value=format_role_list(get_roles_from_config(self.bot, interaction.guild, "normal_staff")), inline=False)
         embed.add_field(name="Normal ping roles", value=format_role_list(get_roles_from_config(self.bot, interaction.guild, "normal_ping")), inline=False)
