@@ -539,12 +539,20 @@ def ticket_base_channel_name(channel: discord.TextChannel) -> str:
     return f"ticket-{ticket_number}"
 
 
+def discord_username_for_channel(member: discord.Member) -> str:
+    raw_name = getattr(member, "name", "") or member.display_name
+    return slugify(raw_name)[:40] or "user"
+
+
 def claimed_channel_name(member: discord.Member, channel: discord.TextChannel) -> str:
-    safe_name = slugify(member.display_name)[:24]
+    safe_name = discord_username_for_channel(member)
     ticket_number = get_ticket_number(channel)
-    if get_ticket_kind(channel) == "priority":
-        return f"priority-{safe_name}-{ticket_number}"[:95]
     return f"{safe_name}-{ticket_number}"[:95]
+
+
+def notes_channel_name(ticket_channel: discord.TextChannel) -> str:
+    ticket_number = get_ticket_number(ticket_channel)
+    return f"notes-{ticket_number}"[:95]
 
 
 def format_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
@@ -633,6 +641,15 @@ async def safe_edit_channel_name(channel: discord.TextChannel, name: str, *, rea
     try:
         await channel.edit(name=name, reason=reason)
     except discord.HTTPException:
+        pass
+
+
+async def safe_edit_notes_name(notes_channel: discord.abc.GuildChannel, name: str, *, reason: str) -> None:
+    if getattr(notes_channel, "name", None) == name:
+        return
+    try:
+        await notes_channel.edit(name=name, reason=reason)
+    except (discord.Forbidden, discord.HTTPException, TypeError):
         pass
 
 
@@ -1371,8 +1388,7 @@ async def create_staff_notes_channel_fallback(
     )
 
     category = ticket_channel.category
-    ticket_number = get_ticket_number(ticket_channel)
-    name = f"notes-{ticket_number}-{ticket_channel.name}"[:95]
+    name = notes_channel_name(ticket_channel)
     topic = f"staff_notes_for:{ticket_channel.id}|ticket_owner:{owner_id or 0}"
 
     try:
@@ -1408,14 +1424,16 @@ async def create_or_get_notes_thread(
     creator: discord.Member,
 ) -> tuple[Optional[discord.abc.GuildChannel], str]:
     existing = await get_notes_thread(bot, guild, channel)
+    clean_notes_name = notes_channel_name(channel)
     if existing is not None:
         await ensure_notes_participant(existing, creator)
+        await safe_edit_notes_name(existing, clean_notes_name, reason="Normalize staff notes channel name.")
         return existing, "existing"
 
     private_thread_error = ""
     try:
         thread = await channel.create_thread(
-            name=f"staff-notes-{channel.name}"[:100],
+            name=clean_notes_name[:100],
             type=discord.ChannelType.private_thread,
             invitable=False,
             reason=f"Staff notes created by {creator} ({creator.id})",
@@ -1430,7 +1448,7 @@ async def create_or_get_notes_thread(
     except TypeError:
         try:
             thread = await channel.create_thread(
-                name=f"staff-notes-{channel.name}"[:100],
+                name=clean_notes_name[:100],
                 type=discord.ChannelType.private_thread,
                 reason=f"Staff notes created by {creator} ({creator.id})",
             )
