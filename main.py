@@ -1275,6 +1275,7 @@ async def build_ticket_and_notes_transcript_text(
     channel: discord.TextChannel,
     notes_thread: Optional[discord.abc.GuildChannel] = None,
     audit_text: str = "",
+    extra_notes_channels: Optional[list[discord.abc.GuildChannel]] = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"Transcript for #{channel.name}")
@@ -1297,9 +1298,20 @@ async def build_ticket_and_notes_transcript_text(
     lines.append("STAFF NOTES")
     lines.append("=" * 70)
 
+    notes_sources: list[discord.abc.GuildChannel] = []
     if notes_thread is not None:
-        lines.append(f"Notes Thread: #{notes_thread.name} ({notes_thread.id})")
-        await append_history_lines(lines, notes_thread, label="STAFF NOTES THREAD")
+        notes_sources.append(notes_thread)
+    if extra_notes_channels:
+        for notes_channel in extra_notes_channels:
+            if notes_channel is not None and notes_channel not in notes_sources:
+                notes_sources.append(notes_channel)
+
+    if notes_sources:
+        for notes_source in notes_sources:
+            source_type = "Thread" if isinstance(notes_source, discord.Thread) else "Legacy Channel"
+            lines.append(f"Notes {source_type}: #{notes_source.name} ({notes_source.id})")
+            await append_history_lines(lines, notes_source, label=f"STAFF NOTES {source_type.upper()}")
+            lines.append("")
     else:
         lines.append("No staff notes thread was linked to this ticket.")
 
@@ -1385,6 +1397,62 @@ async def get_notes_thread(
         return cached
 
     return None
+
+
+
+def legacy_notes_channel_belongs_to_ticket(notes_channel: discord.abc.GuildChannel, ticket_channel: discord.TextChannel) -> bool:
+    """Return True for old fallback notes text channels linked to this exact ticket.
+
+    New notes are always private threads under the ticket. This helper only exists
+    so older notes-### text channels can be included in the transcript and deleted
+    when their matching ticket closes.
+    """
+    if not isinstance(notes_channel, discord.TextChannel):
+        return False
+    if notes_channel.id == ticket_channel.id:
+        return False
+
+    topic = notes_channel.topic or ""
+    if f"staff_notes_for:{ticket_channel.id}" in topic:
+        return True
+
+    expected_name = notes_channel_name(ticket_channel)
+    same_category = getattr(notes_channel.category, "id", None) == getattr(ticket_channel.category, "id", None)
+    return bool(same_category and notes_channel.name == expected_name)
+
+
+def find_legacy_notes_channels_for_ticket(
+    guild: discord.Guild,
+    ticket_channel: discord.TextChannel,
+) -> list[discord.TextChannel]:
+    """Find old notes-### text channels for this ticket only.
+
+    These are from older builds that used a fallback staff-only text channel. They
+    should not be reused for new notes, but they should be transcripted and
+    removed when the matching ticket closes.
+    """
+    matches: list[discord.TextChannel] = []
+    for candidate in guild.text_channels:
+        if legacy_notes_channel_belongs_to_ticket(candidate, ticket_channel):
+            matches.append(candidate)
+
+    matches.sort(key=lambda channel: channel.created_at or now_utc())
+    return matches
+
+
+def format_notes_sources_for_embed(
+    notes_thread: Optional[discord.abc.GuildChannel],
+    legacy_notes_channels: Optional[list[discord.TextChannel]] = None,
+) -> str:
+    sources: list[str] = []
+    if notes_thread is not None:
+        sources.append(notes_thread.mention)
+    for notes_channel in legacy_notes_channels or []:
+        sources.append(notes_channel.mention)
+
+    if not sources:
+        return "No staff notes were linked."
+    return truncate("Included from " + ", ".join(sources), 1024)
 
 
 async def ensure_notes_participant(notes_channel, member: discord.Member) -> None:
@@ -1983,8 +2051,14 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         self.bot.stats_store.ensure_ticket_from_channel(self.channel)
         self.bot.stats_store.record_close(interaction.guild.id, self.channel.id, interaction.user.id, reason_text)
         notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
+        legacy_notes_channels = find_legacy_notes_channels_for_ticket(interaction.guild, self.channel)
         audit_text = build_ticket_audit_text(self.bot, interaction.guild, self.channel)
-        transcript_text = await build_ticket_and_notes_transcript_text(self.channel, notes_thread, audit_text=audit_text)
+        transcript_text = await build_ticket_and_notes_transcript_text(
+            self.channel,
+            notes_thread,
+            audit_text=audit_text,
+            extra_notes_channels=legacy_notes_channels,
+        )
         try:
             save_ticket_log_text(interaction.guild.id, ticket_log_id, transcript_text)
         except OSError:
@@ -2004,7 +2078,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         embed.add_field(name="Closed At", value=closed_at.strftime("%Y-%m-%d %H:%M:%S UTC"), inline=False)
         embed.add_field(
             name="Staff Notes",
-            value=(f"Included from {notes_thread.mention}" if notes_thread is not None else "No staff notes were linked."),
+            value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
             inline=False,
         )
         embed.add_field(
@@ -2051,11 +2125,14 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         except discord.HTTPException:
             pass
 
-        if isinstance(notes_thread, discord.TextChannel):
+        for legacy_notes_channel in legacy_notes_channels:
             try:
-                await notes_thread.delete(reason=f"Ticket {self.channel.id} closed; staff notes transcript saved.")
+                await legacy_notes_channel.delete(reason=f"Ticket {self.channel.id} closed; legacy staff notes transcript saved.")
             except discord.HTTPException:
                 pass
+
+        if notes_thread is not None:
+            clear_notes_thread_id(self.bot, interaction.guild.id, self.channel.id)
 
         await asyncio.sleep(4)
         try:
@@ -2721,8 +2798,22 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             await interaction.followup.send(status, ephemeral=True)
             return
 
+        legacy_notes_channels = find_legacy_notes_channels_for_ticket(interaction.guild, channel)
+        legacy_notice = ""
+        if legacy_notes_channels:
+            legacy_notice = (
+                "\n\nI also found old separate notes channel(s) for this ticket: "
+                + ", ".join(notes_channel.mention for notes_channel in legacy_notes_channels)
+                + "\nThey will be included in the transcript and deleted when this ticket closes."
+            )
+
         msg = "Created" if status == "created" else "Opened existing"
-        await interaction.followup.send(f"{msg} staff notes thread: {thread.mention}\nNotes will be appended under a **STAFF NOTES** divider in the ticket transcript.", ephemeral=True)
+        await interaction.followup.send(
+            f"{msg} staff notes thread: {thread.mention}\n"
+            f"Notes will be appended under a **STAFF NOTES** divider in the ticket transcript."
+            f"{legacy_notice}",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="admin", description="Open the ticket admin control panel.")
     @app_commands.default_permissions(manage_guild=True)
