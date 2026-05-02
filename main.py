@@ -1056,6 +1056,19 @@ def set_notes_thread_id(bot: "TicketBot", guild_id: int, ticket_channel_id: int,
     bot.config_store.update_guild(guild_id, notes_thread_ids=mapping)
 
 
+def clear_notes_thread_id(bot: "TicketBot", guild_id: int, ticket_channel_id: int) -> None:
+    """Remove a stale or invalid notes-thread mapping for one ticket channel."""
+    config = bot.config_store.get_guild(guild_id)
+    mapping = config.get("notes_thread_ids", {})
+    if not isinstance(mapping, dict):
+        bot.config_store.update_guild(guild_id, notes_thread_ids={})
+        return
+
+    if str(ticket_channel_id) in mapping:
+        mapping.pop(str(ticket_channel_id), None)
+        bot.config_store.update_guild(guild_id, notes_thread_ids=mapping)
+
+
 def get_ticket_log_id(channel: discord.TextChannel) -> str:
     return str(channel.id)
 
@@ -1304,30 +1317,73 @@ def save_ticket_log_text(guild_id: int, ticket_id: str, transcript_text: str) ->
     return path
 
 
+def notes_thread_belongs_to_ticket(notes_channel: discord.abc.GuildChannel, ticket_channel: discord.TextChannel) -> bool:
+    """Return True only when a notes target is a private/public thread under this exact ticket."""
+    if not isinstance(notes_channel, discord.Thread):
+        return False
+
+    parent_id = getattr(notes_channel, "parent_id", None)
+    if parent_id == ticket_channel.id:
+        return True
+
+    parent = getattr(notes_channel, "parent", None)
+    return getattr(parent, "id", None) == ticket_channel.id
+
+
+async def find_cached_notes_thread_for_ticket(
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+) -> Optional[discord.Thread]:
+    """Reconnect to an already-created notes thread under this ticket when the stored mapping is missing/stale."""
+    expected_name = notes_channel_name(channel)
+    candidates: list[discord.Thread] = []
+
+    channel_threads = getattr(channel, "threads", []) or []
+    guild_threads = getattr(guild, "threads", []) or []
+
+    for thread in list(channel_threads) + list(guild_threads):
+        if not isinstance(thread, discord.Thread):
+            continue
+        if not notes_thread_belongs_to_ticket(thread, channel):
+            continue
+        if thread.name == expected_name or thread.name.startswith(f"{expected_name}-"):
+            candidates.append(thread)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda thread: getattr(thread, "created_at", None) or now_utc(), reverse=True)
+    return candidates[0]
+
+
 async def get_notes_thread(
     bot: "TicketBot",
     guild: discord.Guild,
     channel: discord.TextChannel,
-) -> Optional[discord.abc.GuildChannel]:
+) -> Optional[discord.Thread]:
     notes_id = get_notes_thread_id(bot, guild.id, channel.id)
-    if not notes_id:
-        return None
+    if notes_id:
+        notes_channel: Optional[Any] = guild.get_thread(notes_id)
+        if notes_channel is None:
+            notes_channel = guild.get_channel(notes_id)
 
-    thread = guild.get_thread(notes_id)
-    if thread is not None:
-        return thread
+        if notes_channel is None:
+            try:
+                notes_channel = await bot.fetch_channel(notes_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                notes_channel = None
 
-    found = guild.get_channel(notes_id)
-    if found is not None:
-        return found
+        if notes_channel is not None and notes_thread_belongs_to_ticket(notes_channel, channel):
+            return notes_channel
 
-    try:
-        fetched = await bot.fetch_channel(notes_id)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return None
+        # Never reuse a notes channel/thread that does not belong under this ticket.
+        clear_notes_thread_id(bot, guild.id, channel.id)
 
-    if isinstance(fetched, (discord.Thread, discord.TextChannel)):
-        return fetched
+    cached = await find_cached_notes_thread_for_ticket(guild, channel)
+    if cached is not None:
+        set_notes_thread_id(bot, guild.id, channel.id, cached.id)
+        return cached
+
     return None
 
 
@@ -1340,97 +1396,19 @@ async def ensure_notes_participant(notes_channel, member: discord.Member) -> Non
             pass
 
 
-async def create_staff_notes_channel_fallback(
-    bot: "TicketBot",
-    guild: discord.Guild,
-    ticket_channel: discord.TextChannel,
-    creator: discord.Member,
-) -> tuple[Optional[discord.TextChannel], str]:
-    """Create a hidden staff-only notes text channel if private threads are unavailable."""
-    owner_id = get_ticket_owner_id(ticket_channel)
-    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-    }
-
-    me = guild.me
-    if me is not None:
-        overwrites[me] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_channels=True,
-            manage_messages=True,
-            embed_links=True,
-            attach_files=True,
-        )
-
-    staff_roles: list[discord.Role] = []
-    for role in get_staff_roles(bot, guild) + get_priority_staff_roles(bot, guild):
-        if role not in staff_roles and not role.is_default():
-            staff_roles.append(role)
-
-    for role in staff_roles:
-        overwrites[role] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_messages=True,
-            embed_links=True,
-            attach_files=True,
-        )
-
-    overwrites[creator] = discord.PermissionOverwrite(
-        view_channel=True,
-        send_messages=True,
-        read_message_history=True,
-        embed_links=True,
-        attach_files=True,
-    )
-
-    category = ticket_channel.category
-    name = notes_channel_name(ticket_channel)
-    topic = f"staff_notes_for:{ticket_channel.id}|ticket_owner:{owner_id or 0}"
-
-    try:
-        notes_channel = await guild.create_text_channel(
-            name=name,
-            category=category,
-            overwrites=overwrites,
-            topic=topic,
-            reason=f"Staff notes fallback created by {creator} ({creator.id})",
-        )
-    except discord.Forbidden:
-        return None, (
-            "I could not create staff notes. I tried a private thread and a staff-only notes channel.\n\n"
-            "Give the bot **Create Private Threads**, **Send Messages in Threads**, **Manage Threads**, "
-            "and **Manage Channels** in the ticket category."
-        )
-    except discord.HTTPException as exc:
-        return None, f"Discord refused both staff-notes methods: `{exc}`"
-
-    set_notes_thread_id(bot, guild.id, ticket_channel.id, notes_channel.id)
-    await notes_channel.send(
-        "📝 **Staff Notes**\n"
-        f"Linked ticket: {ticket_channel.mention}\n"
-        "This is a staff-only fallback notes channel. These messages are appended to the ticket transcript when the ticket closes."
-    )
-    return notes_channel, "created_channel"
-
-
 async def create_or_get_notes_thread(
     bot: "TicketBot",
     guild: discord.Guild,
     channel: discord.TextChannel,
     creator: discord.Member,
-) -> tuple[Optional[discord.abc.GuildChannel], str]:
+) -> tuple[Optional[discord.Thread], str]:
     existing = await get_notes_thread(bot, guild, channel)
     clean_notes_name = notes_channel_name(channel)
     if existing is not None:
         await ensure_notes_participant(existing, creator)
-        await safe_edit_notes_name(existing, clean_notes_name, reason="Normalize staff notes channel name.")
+        await safe_edit_notes_name(existing, clean_notes_name, reason="Normalize staff notes thread name.")
         return existing, "existing"
 
-    private_thread_error = ""
     try:
         thread = await channel.create_thread(
             name=clean_notes_name[:100],
@@ -1438,38 +1416,47 @@ async def create_or_get_notes_thread(
             invitable=False,
             reason=f"Staff notes created by {creator} ({creator.id})",
         )
-        await ensure_notes_participant(thread, creator)
-        set_notes_thread_id(bot, guild.id, channel.id, thread.id)
-        await thread.send(
-            "📝 **Staff Notes**\n"
-            "Use this private thread for internal discussion. These notes are appended to the ticket transcript when the ticket closes."
-        )
-        return thread, "created"
     except TypeError:
+        # Older discord.py builds may not accept the invitable argument.
         try:
             thread = await channel.create_thread(
                 name=clean_notes_name[:100],
                 type=discord.ChannelType.private_thread,
                 reason=f"Staff notes created by {creator} ({creator.id})",
             )
-            await ensure_notes_participant(thread, creator)
-            set_notes_thread_id(bot, guild.id, channel.id, thread.id)
-            await thread.send(
-                "📝 **Staff Notes**\n"
-                "Use this private thread for internal discussion. These notes are appended to the ticket transcript when the ticket closes."
+        except discord.Forbidden:
+            return None, (
+                "I could not create a private notes thread under this ticket.\n\n"
+                "Give the bot **Create Private Threads**, **Send Messages in Threads**, and **Manage Threads** "
+                "inside the ticket category/channel, then run `/ticket notes` again. I did **not** create a separate notes channel, "
+                "so notes will not be grouped with other tickets."
             )
-            return thread, "created"
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            private_thread_error = str(exc)
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        private_thread_error = str(exc)
+        except discord.HTTPException as exc:
+            return None, f"Discord refused to create the staff-notes thread under this ticket: `{truncate(str(exc), 500)}`"
+    except discord.Forbidden:
+        return None, (
+            "I could not create a private notes thread under this ticket.\n\n"
+            "Give the bot **Create Private Threads**, **Send Messages in Threads**, and **Manage Threads** "
+            "inside the ticket category/channel, then run `/ticket notes` again. I did **not** create a separate notes channel, "
+            "so notes will not be grouped with other tickets."
+        )
+    except discord.HTTPException as exc:
+        return None, f"Discord refused to create the staff-notes thread under this ticket: `{truncate(str(exc), 500)}`"
 
-    notes_channel, status = await create_staff_notes_channel_fallback(bot, guild, channel, creator)
-    if notes_channel is None:
-        if private_thread_error:
-            status += f"\nPrivate thread error: `{truncate(private_thread_error, 500)}`"
-        return None, status
-    return notes_channel, status
+    if not notes_thread_belongs_to_ticket(thread, channel):
+        clear_notes_thread_id(bot, guild.id, channel.id)
+        return None, "Discord created a notes thread, but it was not linked under this ticket. I stopped to prevent mixed ticket notes."
+
+    await ensure_notes_participant(thread, creator)
+    set_notes_thread_id(bot, guild.id, channel.id, thread.id)
+    await thread.send(
+        "📝 **Staff Notes**\n"
+        f"Linked ticket: {channel.mention} (`{channel.id}`)\n"
+        f"Ticket number: `{get_ticket_number(channel)}`\n\n"
+        "Use this private thread for this ticket only. These notes are appended to this ticket transcript when the ticket closes."
+    )
+    return thread, "created"
+
 
 async def create_ticket_channel(
     bot: "TicketBot",
@@ -1531,6 +1518,8 @@ async def create_ticket_channel(
             manage_channels=True,
             manage_messages=True,
             manage_threads=True,
+            create_private_threads=True,
+            send_messages_in_threads=True,
             embed_links=True,
             attach_files=True,
         )
@@ -1541,6 +1530,9 @@ async def create_ticket_channel(
             send_messages=True,
             read_message_history=True,
             manage_messages=True,
+            manage_threads=True,
+            create_private_threads=True,
+            send_messages_in_threads=True,
             attach_files=True,
             embed_links=True,
         )
