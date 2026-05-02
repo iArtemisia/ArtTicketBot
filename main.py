@@ -1440,6 +1440,31 @@ def find_legacy_notes_channels_for_ticket(
     return matches
 
 
+def resolve_ticket_channel_from_context(
+    guild: discord.Guild,
+    channel: Optional[discord.abc.Messageable],
+) -> Optional[discord.TextChannel]:
+    """Resolve the ticket text channel from a ticket channel, notes thread, or old notes channel."""
+    if isinstance(channel, discord.TextChannel) and is_ticket_channel(channel):
+        return channel
+
+    if isinstance(channel, discord.Thread):
+        parent = channel.parent
+        if isinstance(parent, discord.TextChannel) and is_ticket_channel(parent):
+            return parent
+
+    # Legacy fallback notes channels used a staff_notes_for:<ticket_channel_id> topic.
+    # Let shortcut commands still find the real ticket from those old channels.
+    if isinstance(channel, discord.TextChannel):
+        match = re.search(r"staff_notes_for:(\d{15,25})", channel.topic or "")
+        if match:
+            ticket_channel = guild.get_channel(int(match.group(1)))
+            if isinstance(ticket_channel, discord.TextChannel) and is_ticket_channel(ticket_channel):
+                return ticket_channel
+
+    return None
+
+
 def format_notes_sources_for_embed(
     notes_thread: Optional[discord.abc.GuildChannel],
     legacy_notes_channels: Optional[list[discord.TextChannel]] = None,
@@ -3207,6 +3232,79 @@ class StatsCommands(commands.GroupCog, group_name="stats", group_description="Ti
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class StarzShortcutCommands(commands.Cog):
+    """Top-level STARZ-prefixed slash shortcuts to avoid generic command-name conflicts."""
+
+    def __init__(self, bot: "TicketBot"):
+        self.bot = bot
+
+    @app_commands.command(name="sclose", description="Close the current STARZ ticket.")
+    @app_commands.guild_only()
+    async def sclose(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        ticket_channel = resolve_ticket_channel_from_context(interaction.guild, interaction.channel)
+        if ticket_channel is None:
+            await interaction.response.send_message(
+                "Use `/sclose` inside a ticket channel or its staff-notes thread.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(CloseTicketModal(self.bot, ticket_channel))
+
+    @app_commands.command(name="snotes", description="Create or open the STARZ staff-notes thread for this ticket.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_messages=True)
+    async def snotes(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        ticket_channel = resolve_ticket_channel_from_context(interaction.guild, interaction.channel)
+        if ticket_channel is None:
+            await interaction.response.send_message(
+                "Use `/snotes` inside a ticket channel or its staff-notes thread.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        thread, status = await create_or_get_notes_thread(self.bot, interaction.guild, ticket_channel, interaction.user)
+        if thread is None:
+            await interaction.followup.send(status, ephemeral=True)
+            return
+
+        legacy_notes_channels = find_legacy_notes_channels_for_ticket(interaction.guild, ticket_channel)
+        legacy_notice = ""
+        if legacy_notes_channels:
+            legacy_notice = (
+                "\n\nI also found old separate notes channel(s) for this ticket: "
+                + ", ".join(notes_channel.mention for notes_channel in legacy_notes_channels)
+                + "\nThey will be included in the transcript and deleted when this ticket closes."
+            )
+
+        msg = "Created" if status == "created" else "Opened existing"
+        await interaction.followup.send(
+            f"{msg} staff notes thread: {thread.mention}\n"
+            f"Notes will be appended under a **STAFF NOTES** divider in the ticket transcript."
+            f"{legacy_notice}",
+            ephemeral=True,
+        )
+
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        if isinstance(error, app_commands.MissingPermissions):
+            message = "You do not have permission to use that command."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+        raise error
+
+
 class TicketBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -3221,6 +3319,7 @@ class TicketBot(commands.Bot):
         self.add_view(TicketPanelView(self))
         self.add_view(TicketChannelView(self))
         await self.add_cog(TicketCommands(self))
+        await self.add_cog(StarzShortcutCommands(self))
         await self.add_cog(TagCommands(self))
         await self.add_cog(StatsCommands(self))
         await self.tree.sync()
