@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "true").strip().lower() not in {"0", "false", "no", "off"}
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
@@ -1285,6 +1286,34 @@ def append_indented_text(lines: list[str], value: str, *, indent: str = "    ", 
             lines.append("")
 
 
+def get_message_text_for_transcript(message: discord.Message) -> str:
+    """Return the best readable text Discord exposes for this message.
+
+    Regular user message content requires Discord's privileged Message Content
+    Intent. If that intent is disabled in the Developer Portal or disabled in
+    code, Discord returns empty text when we read channel history.
+    """
+    candidates = (
+        getattr(message, "clean_content", ""),
+        getattr(message, "content", ""),
+        getattr(message, "system_content", ""),
+    )
+    for candidate in candidates:
+        clean_candidate = clean_transcript_text(candidate)
+        if clean_candidate:
+            return clean_candidate
+    return ""
+
+
+def message_has_visible_non_text(message: discord.Message) -> bool:
+    return bool(
+        getattr(message, "attachments", None)
+        or getattr(message, "embeds", None)
+        or getattr(message, "stickers", None)
+        or getattr(message, "components", None)
+    )
+
+
 def format_transcript_author(message: discord.Message) -> str:
     author = message.author
     display_name = getattr(author, "display_name", None) or getattr(author, "name", None) or str(author)
@@ -1298,34 +1327,39 @@ def append_embed_transcript(lines: list[str], message: discord.Message) -> None:
     if not message.embeds:
         return
 
-    lines.append("    Embeds:")
     for index, embed in enumerate(message.embeds, start=1):
-        title = clean_transcript_text(embed.title) or "Untitled embed"
-        lines.append(f"      [{index}] {title}")
-
+        title = clean_transcript_text(embed.title)
         description = clean_transcript_text(embed.description)
+        summary_parts: list[str] = []
+        if title:
+            summary_parts.append(title)
         if description:
-            lines.append("          Description:")
-            append_indented_text(lines, description, indent="            ", empty="")
+            summary_parts.append(truncate(description.replace("\n", " "), 220))
+
+        label = f"Embed {index}"
+        if summary_parts:
+            lines.append(f"    [{label}] " + " — ".join(summary_parts))
+        else:
+            lines.append(f"    [{label}] Embed with no readable title/description")
 
         if embed.fields:
-            lines.append("          Fields:")
-            for field in embed.fields:
+            for field in embed.fields[:8]:
                 field_name = clean_transcript_text(field.name) or "Unnamed field"
                 field_value = clean_transcript_text(field.value) or "[empty]"
-                lines.append(f"            - {field_name}:")
-                append_indented_text(lines, field_value, indent="                ", empty="[empty]")
+                lines.append(f"      • {field_name}: {truncate(field_value.replace(chr(10), ' / '), 220)}")
+            if len(embed.fields) > 8:
+                lines.append(f"      • ... {len(embed.fields) - 8} more field(s)")
 
         footer_text = clean_transcript_text(getattr(embed.footer, "text", ""))
         if footer_text:
-            lines.append(f"          Footer: {footer_text}")
+            lines.append(f"      Footer: {footer_text}")
 
         image_url = getattr(getattr(embed, "image", None), "url", None)
         thumbnail_url = getattr(getattr(embed, "thumbnail", None), "url", None)
         if image_url:
-            lines.append(f"          Image: {image_url}")
+            lines.append(f"      Image: {image_url}")
         if thumbnail_url:
-            lines.append(f"          Thumbnail: {thumbnail_url}")
+            lines.append(f"      Thumbnail: {thumbnail_url}")
 
 
 def append_attachment_transcript(lines: list[str], message: discord.Message) -> None:
@@ -1341,11 +1375,23 @@ def append_attachment_transcript(lines: list[str], message: discord.Message) -> 
         lines.append(f"        {attachment.url}")
 
 
+
+def append_sticker_transcript(lines: list[str], message: discord.Message) -> None:
+    stickers = getattr(message, "stickers", None)
+    if not stickers:
+        return
+
+    lines.append("    Stickers:")
+    for sticker in stickers:
+        name = clean_transcript_text(getattr(sticker, "name", "")) or "sticker"
+        lines.append(f"      - {name}")
+
 async def append_history_lines(lines: list[str], source, *, label: str, include_section: bool = True) -> int:
     if include_section:
         append_transcript_section(lines, label)
 
     count = 0
+    unreadable_text_count = 0
     current_day = ""
 
     try:
@@ -1361,9 +1407,17 @@ async def append_history_lines(lines: list[str], source, *, label: str, include_
             author = format_transcript_author(message)
             lines.append(f"[{time_label}] {author}")
 
-            content = clean_transcript_text(getattr(message, "clean_content", "") or message.content or "")
-            append_indented_text(lines, content, empty="[no message text]")
+            content = get_message_text_for_transcript(message)
+            if content:
+                append_indented_text(lines, content, empty="")
+            elif message_has_visible_non_text(message):
+                lines.append("    [no written text; see attachments/embeds/stickers below]")
+            else:
+                unreadable_text_count += 1
+                lines.append("    [message text unavailable]")
+
             append_attachment_transcript(lines, message)
+            append_sticker_transcript(lines, message)
             append_embed_transcript(lines, message)
 
             if getattr(message, "reactions", None):
@@ -1381,6 +1435,15 @@ async def append_history_lines(lines: list[str], source, *, label: str, include_
 
     if count == 0:
         lines.append("No messages found in this section.")
+        lines.append("")
+    elif unreadable_text_count:
+        lines.append("NOTE:")
+        lines.append(
+            f"  {unreadable_text_count} message(s) had no readable text. "
+            "This usually means Discord Message Content Intent was disabled when the transcript was generated."
+        )
+        lines.append("  Enable Message Content Intent in the Discord Developer Portal and keep ENABLE_MESSAGE_CONTENT_INTENT=true.")
+        lines.append("  Messages already closed/transcripted while the intent was disabled cannot have their text recovered by the bot.")
         lines.append("")
 
     return count
@@ -1405,19 +1468,23 @@ async def build_ticket_and_notes_transcript_text(
     generated_at = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     lines.append(transcript_line("="))
-    lines.append("STARZ TICKET TRANSCRIPT")
+    lines.append(f"STARZ TICKET #{ticket_number} TRANSCRIPT")
     lines.append(transcript_line("="))
-    lines.append(f"Ticket Number : {ticket_number}")
-    lines.append(f"Ticket Type   : {ticket_kind}")
-    lines.append(f"Ticket Channel: #{channel.name} ({channel.id})")
-    lines.append(f"Ticket Owner  : {format_user_reference(channel.guild, owner_id)}")
-    lines.append(f"Claimed By    : {format_user_reference(channel.guild, claimed_by)}")
-    lines.append(f"Generated     : {generated_at}")
+    lines.append(f"Type       : {ticket_kind}")
+    lines.append(f"Channel    : #{channel.name} ({channel.id})")
+    lines.append(f"Owner      : {format_user_reference(channel.guild, owner_id)}")
+    lines.append(f"Claimed By : {format_user_reference(channel.guild, claimed_by)}")
+    lines.append(f"Generated  : {generated_at}")
     lines.append(transcript_line("="))
+    lines.append("")
+    lines.append("READING NOTES:")
+    lines.append("- Conversation is grouped by day and then ordered oldest to newest.")
+    lines.append("- User/staff messages appear as timestamp, display name, Discord username, and Discord ID.")
+    lines.append("- If a line says [message text unavailable], Discord did not expose that message text to the bot.")
     lines.append("")
 
     if audit_text:
-        append_transcript_section(lines, "Ticket Audit / Staff Activity")
+        append_transcript_section(lines, "Ticket Summary")
         append_indented_text(lines, audit_text, indent="  ", empty="No audit data available.")
 
     await append_history_lines(lines, channel, label="Ticket Conversation")
@@ -1430,16 +1497,15 @@ async def build_ticket_and_notes_transcript_text(
             if notes_channel is not None and notes_channel not in notes_sources:
                 notes_sources.append(notes_channel)
 
+    append_transcript_section(lines, "Staff Notes")
     if notes_sources:
-        append_transcript_section(lines, "Staff Notes")
-        lines.append("These are internal staff notes linked to this ticket.")
+        lines.append("Internal staff notes linked to this exact ticket.")
         lines.append("")
         for notes_source in notes_sources:
             source_type = "Private Thread" if isinstance(notes_source, discord.Thread) else "Legacy Notes Channel"
             append_transcript_subsection(lines, f"{source_type}: #{notes_source.name} ({notes_source.id})")
             await append_history_lines(lines, notes_source, label=f"Staff Notes - {source_type}", include_section=False)
     else:
-        append_transcript_section(lines, "Staff Notes")
         lines.append("No staff notes thread was linked to this ticket.")
         lines.append("")
 
@@ -3439,6 +3505,7 @@ class TicketBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.guilds = True
+        intents.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 
         super().__init__(command_prefix="!", intents=intents)
         self.config_store = GuildConfigStore(CONFIG_PATH)
@@ -3457,6 +3524,10 @@ class TicketBot(commands.Bot):
     async def on_ready(self) -> None:
         if self.user is not None:
             print(f"Logged in as {self.user} (ID: {self.user.id})")
+            if ENABLE_MESSAGE_CONTENT_INTENT:
+                print("Message Content Intent requested: ON")
+            else:
+                print("Message Content Intent requested: OFF - ticket transcripts may show [message text unavailable].")
             print("------")
 
     async def on_message(self, message: discord.Message) -> None:
