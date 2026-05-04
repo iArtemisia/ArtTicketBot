@@ -1299,25 +1299,21 @@ async def log_event(
     await log_channel.send(embed=embed, file=file)
 
 
-def transcript_line(char: str = "=", width: int = 88) -> str:
+def transcript_line(char: str = "-", width: int = 42) -> str:
     return char * width
 
 
 def append_transcript_section(lines: list[str], title: str) -> None:
     if lines and lines[-1] != "":
         lines.append("")
-    lines.append(transcript_line("="))
-    lines.append(transcript_safe_text(title).upper())
-    lines.append(transcript_line("="))
+    lines.append(f"--- {transcript_safe_text(title).upper()} ---")
     lines.append("")
 
 
 def append_transcript_subsection(lines: list[str], title: str) -> None:
     if lines and lines[-1] != "":
         lines.append("")
-    lines.append(transcript_line("-", 72))
-    lines.append(transcript_safe_text(title))
-    lines.append(transcript_line("-", 72))
+    lines.append(f"[{transcript_safe_text(title)}]")
 
 
 def transcript_safe_text(value: Any) -> str:
@@ -1408,6 +1404,42 @@ def is_transcript_event_message(message: discord.Message) -> bool:
 
     message_type = getattr(message, "type", discord.MessageType.default)
     return message_type != discord.MessageType.default
+
+
+def format_transcript_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
+    """Format users in transcript/log review text without Discord mentions.
+
+    Mentions like <@123> are noisy in transcript files and Discord previews. This
+    keeps the readable Discord display name while preserving the Discord ID for
+    follow-up or moderation lookups.
+    """
+    if not user_id:
+        return "None"
+
+    member = guild.get_member(int(user_id))
+    if member is not None:
+        display_name = clean_transcript_text(getattr(member, "display_name", None) or getattr(member, "name", None) or str(member))
+        username = clean_transcript_text(getattr(member, "name", None) or str(member))
+        if display_name and username and display_name.lower() != username.lower():
+            return f"{display_name} (@{username}) - {member.id}"
+        if display_name:
+            return f"{display_name} - {member.id}"
+        return f"User {member.id} - {member.id}"
+
+    return f"Unknown User - {int(user_id)}"
+
+
+def format_transcript_user_value(guild: discord.Guild, raw_value: Any) -> str:
+    """Convert a mention-like audit value into transcript-friendly name + ID text."""
+    value = clean_transcript_text(raw_value)
+    if not value or value == "None":
+        return "None"
+
+    user_id = extract_id(value)
+    if user_id is not None:
+        return format_transcript_user_reference(guild, user_id)
+
+    return value
 
 
 def format_transcript_author(message: discord.Message) -> str:
@@ -1741,24 +1773,22 @@ def append_compact_ticket_header(
     generated_at: str,
 ) -> None:
     """Single source of ticket metadata so transcripts do not repeat themselves."""
-    closed_by = audit_field_value(audit_text, "Closed By")
+    closed_by = format_transcript_user_value(channel.guild, audit_field_value(audit_text, "Closed By"))
     opened_at = audit_field_value(audit_text, "Opened At")
     closed_at = audit_field_value(audit_text, "Closed At")
     close_reason = audit_field_value(audit_text, "Close Reason")
 
-    lines.append(transcript_line("="))
-    lines.append(f"STARZ TICKET #{ticket_number} TRANSCRIPT")
-    lines.append(transcript_line("="))
+    lines.append(f"STARZ Ticket #{ticket_number} Transcript")
+    lines.append(transcript_line("-"))
     lines.append(f"Ticket   : #{ticket_number} - {ticket_kind}")
     lines.append(f"Channel  : #{clean_transcript_text(channel.name)} ({channel.id})")
-    lines.append(f"Owner    : {format_user_reference(channel.guild, owner_id)}")
-    lines.append(f"Claimed  : {format_user_reference(channel.guild, claimed_by)}")
+    lines.append(f"Owner    : {format_transcript_user_reference(channel.guild, owner_id)}")
+    lines.append(f"Claimed  : {format_transcript_user_reference(channel.guild, claimed_by)}")
     lines.append(f"Closed By: {closed_by}")
     lines.append(f"Reason   : {close_reason}")
     if opened_at != "None" or closed_at != "None":
         lines.append(f"Times    : Opened {opened_at} | Closed {closed_at}")
     lines.append(f"Generated: {generated_at}")
-    lines.append(transcript_line("="))
     lines.append("")
 
 
@@ -1886,9 +1916,7 @@ async def build_ticket_and_notes_transcript_text(
             compact_embeds=True,
         )
 
-    lines.append(transcript_line("="))
-    lines.append("END OF TRANSCRIPT")
-    lines.append(transcript_line("="))
+    lines.append("--- END OF TRANSCRIPT ---")
     return "\n".join(lines)
 
 
@@ -2679,9 +2707,9 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         embed.add_field(
             name="People",
             value=(
-                f"**Opened by:** {format_user_reference(interaction.guild, owner_id)}\n"
-                f"**Claimed by:** {format_user_reference(interaction.guild, claimed_by if claimed_by else None)}\n"
-                f"**Closed by:** {interaction.user.mention} (`{interaction.user.id}`)"
+                f"**Opened by:** {format_transcript_user_reference(interaction.guild, owner_id)}\n"
+                f"**Claimed by:** {format_transcript_user_reference(interaction.guild, claimed_by if claimed_by else None)}\n"
+                f"**Closed by:** {format_transcript_user_reference(interaction.guild, interaction.user.id)}"
             ),
             inline=False,
         )
