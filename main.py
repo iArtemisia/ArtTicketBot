@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import json
 import os
@@ -22,7 +23,8 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRANSCRIPT_ASCII_SAFE = os.getenv("TRANSCRIPT_ASCII_SAFE", "true").strip().lower() not in {"0", "false", "no", "off"}
-TRANSCRIPT_INCLUDE_BOT_EVENTS = os.getenv("TRANSCRIPT_INCLUDE_BOT_EVENTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+TRANSCRIPT_INCLUDE_BOT_EVENTS = os.getenv("TRANSCRIPT_INCLUDE_BOT_EVENTS", "true").strip().lower() in {"1", "true", "yes", "on"}
+TRANSCRIPT_HTML_ENABLED = os.getenv("TRANSCRIPT_HTML_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
@@ -1763,6 +1765,168 @@ def transcript_file_from_text(text_value: str, filename: str) -> discord.File:
     return discord.File(io.BytesIO(payload), filename=filename)
 
 
+def transcript_file_from_html(html_value: str, filename: str) -> discord.File:
+    payload = html_value.encode("utf-8")
+    return discord.File(io.BytesIO(payload), filename=filename)
+
+
+def html_linkify_text(value: str) -> str:
+    """Escape text for HTML and turn URLs into review-friendly links."""
+    raw_value = str(value or "")
+    url_pattern = re.compile(r"(https?://[^\s<>'\"]+)")
+    parts: list[str] = []
+    last_index = 0
+
+    for match in url_pattern.finditer(raw_value):
+        parts.append(html.escape(raw_value[last_index:match.start()]))
+        url = match.group(1)
+        safe_url = html.escape(url, quote=True)
+        parts.append(f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{safe_url}</a>')
+        last_index = match.end()
+
+    parts.append(html.escape(raw_value[last_index:]))
+    return "".join(parts)
+
+
+def transcript_html_line_class(line: str) -> str:
+    clean_line = line.strip()
+    if not clean_line:
+        return "blank"
+    if clean_line.startswith("STARZ Ticket"):
+        return "title"
+    if clean_line.startswith("--- ") and clean_line.endswith(" ---"):
+        label = clean_line.strip("- ").lower()
+        if "staff" in label:
+            return "section section-notes"
+        if "evidence" in label or "attachment" in label:
+            return "section section-evidence"
+        if "participant" in label:
+            return "section section-participants"
+        return "section"
+    if clean_line.startswith("[") and clean_line.endswith("]") and "UTC" not in clean_line:
+        return "date"
+    if re.match(r"^\[\d{2}:\d{2} UTC\]", clean_line):
+        return "message"
+    if clean_line.startswith(("Ticket", "Channel", "Owner", "Claimed", "Closed By", "Reason", "Opened", "Closed")):
+        return "meta"
+    if clean_line.startswith(("Attachments:", "Stickers:", "Reactions:")):
+        return "label"
+    if clean_line.startswith(("- ", "* ")):
+        return "bullet"
+    if clean_line == "End of transcript":
+        return "end"
+    return "text"
+
+
+def build_colored_transcript_html(text_value: str, *, page_title: str = "STARZ Ticket Transcript") -> str:
+    """Create a colored, browser-friendly transcript from the plain-text transcript."""
+    safe_title = html.escape(clean_transcript_text(page_title) or "STARZ Ticket Transcript")
+    rendered_lines: list[str] = []
+
+    for raw_line in str(text_value or "").splitlines():
+        css_class = transcript_html_line_class(raw_line)
+        content = html_linkify_text(raw_line) if raw_line else "&nbsp;"
+        rendered_lines.append(f'<div class="line {css_class}">{content}</div>')
+
+    body = "\n".join(rendered_lines)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_title}</title>
+  <style>
+    :root {{
+      --bg: #0f1117;
+      --panel: #161922;
+      --text: #e8eaf0;
+      --muted: #a8adbb;
+      --red: #ff4d4d;
+      --blue: #67b7ff;
+      --green: #70e39b;
+      --purple: #c792ea;
+      --gold: #ffd166;
+      --line: #2c3140;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: linear-gradient(135deg, #0b0d12, #151922);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }}
+    .wrap {{ max-width: 1100px; margin: 0 auto; padding: 28px 18px; }}
+    .card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-left: 6px solid var(--red);
+      border-radius: 18px;
+      box-shadow: 0 18px 60px rgba(0,0,0,.35);
+      padding: 22px;
+      overflow-x: auto;
+    }}
+    .line {{
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      font-size: 14px;
+      min-height: 1.35em;
+    }}
+    .title {{
+      color: #ffffff;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      font-size: 28px;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }}
+    .meta {{ color: var(--muted); }}
+    .section {{
+      color: var(--blue);
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      font-size: 18px;
+      font-weight: 800;
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      letter-spacing: .04em;
+    }}
+    .section-notes {{ color: var(--purple); }}
+    .section-evidence {{ color: var(--gold); }}
+    .section-participants {{ color: var(--green); }}
+    .date {{ color: var(--gold); margin-top: 12px; font-weight: 700; }}
+    .message {{ color: var(--blue); margin-top: 10px; font-weight: 700; }}
+    .label {{ color: var(--purple); font-weight: 700; }}
+    .bullet {{ color: var(--muted); }}
+    .text {{ color: var(--text); }}
+    .blank {{ min-height: .75em; }}
+    .end {{
+      margin-top: 20px;
+      padding-top: 14px;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      font-style: italic;
+    }}
+    a {{ color: var(--green); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    @media (max-width: 640px) {{
+      .wrap {{ padding: 14px 8px; }}
+      .card {{ padding: 16px; border-radius: 14px; }}
+      .title {{ font-size: 22px; }}
+      .line {{ font-size: 12px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+{body}
+    </section>
+  </main>
+</body>
+</html>"""
+
+
 def collect_participant_counts(messages: list[discord.Message]) -> dict[int, dict[str, Any]]:
     participants: dict[int, dict[str, Any]] = {}
     for message in messages:
@@ -2030,6 +2194,19 @@ async def build_ticket_and_notes_transcript_text(
             user_lookup=user_lookup,
         )
 
+    # Keep bot/open/claim/ping events visible, but separated so they do not clutter
+    # the player/staff conversation. Set TRANSCRIPT_INCLUDE_BOT_EVENTS=false only
+    # if you want future transcripts to hide these ticket event messages.
+    if TRANSCRIPT_INCLUDE_BOT_EVENTS and ticket_events:
+        append_transcript_section(lines, "Ticket Events")
+        append_messages_grouped_by_day(
+            lines,
+            ticket_events,
+            empty_text="No ticket event messages were found.",
+            compact_embeds=True,
+            user_lookup=user_lookup,
+        )
+
     append_transcript_section(lines, "Conversation")
     if ticket_read_error:
         lines.append(ticket_read_error)
@@ -2068,19 +2245,6 @@ async def build_ticket_and_notes_transcript_text(
             lines,
             ticket_messages=ticket_messages,
             notes_messages_by_source=notes_messages_by_source,
-            user_lookup=user_lookup,
-        )
-
-    # Bot/system events are usually duplicate noise, so they are hidden by default.
-    # Set TRANSCRIPT_INCLUDE_BOT_EVENTS=true if you want the opener/ping/claim bot
-    # messages included near the bottom of future transcripts.
-    if TRANSCRIPT_INCLUDE_BOT_EVENTS and ticket_events:
-        append_transcript_section(lines, "Bot / System Events")
-        append_messages_grouped_by_day(
-            lines,
-            ticket_events,
-            empty_text="No bot/system ticket events were found.",
-            compact_embeds=True,
             user_lookup=user_lookup,
         )
 
@@ -2887,7 +3051,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
                 value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
                 inline=False,
             )
-        embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • Transcript attached")
+        embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • Colored HTML + plain text transcripts attached")
 
         log_sent = False
         log_error = ""
@@ -2895,11 +3059,19 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             log_error = "No closed-ticket log channel is configured or the configured channel no longer exists."
         else:
             try:
-                transcript = transcript_file_from_text(
-                    transcript_text,
-                    f"ticket-{ticket_number}-{ticket_log_id}-{self.channel.name}-transcript.txt",
-                )
-                await log_channel.send(embed=embed, file=transcript)
+                safe_base_name = f"ticket-{ticket_number}-{ticket_log_id}-{self.channel.name}-transcript"
+                transcript_files: list[discord.File] = []
+
+                if TRANSCRIPT_HTML_ENABLED:
+                    transcript_html = build_colored_transcript_html(
+                        transcript_text,
+                        page_title=f"STARZ Ticket #{ticket_number} Transcript",
+                    )
+                    transcript_files.append(transcript_file_from_html(transcript_html, f"{safe_base_name}.html"))
+
+                transcript_files.append(transcript_file_from_text(transcript_text, f"{safe_base_name}.txt"))
+
+                await log_channel.send(embed=embed, files=transcript_files)
                 log_sent = True
             except discord.Forbidden:
                 log_error = f"I do not have permission to send embeds/files in {log_channel.mention}."
