@@ -25,6 +25,19 @@ ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "true
 TRANSCRIPT_ASCII_SAFE = os.getenv("TRANSCRIPT_ASCII_SAFE", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRANSCRIPT_INCLUDE_BOT_EVENTS = os.getenv("TRANSCRIPT_INCLUDE_BOT_EVENTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 TRANSCRIPT_HTML_ENABLED = os.getenv("TRANSCRIPT_HTML_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+# Discord previews .txt attachments as plain text. By default, attach the colored
+# .html transcript only so staff open the colorized version first. The plain text
+# transcript is still saved locally in data/ticket_logs.
+TRANSCRIPT_TEXT_ATTACHMENT_ENABLED = os.getenv("TRANSCRIPT_TEXT_ATTACHMENT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# STARZ ticket colors. Discord only supports the embed side-strip color and the
+# built-in button styles, so these colors are applied to ticket embeds/events.
+STARZ_COLOR_DARK = 0x10131A
+STARZ_COLOR_RED = 0xE03131
+STARZ_COLOR_BLUE = 0x5865F2
+STARZ_COLOR_GREEN = 0x2ECC71
+STARZ_COLOR_GOLD = 0xF1C40F
+STARZ_COLOR_GRAY = 0x6B7280
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
@@ -567,6 +580,74 @@ def format_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
     if member is not None:
         return f"{member.mention} (`{member.id}`)"
     return f"<@{user_id}> (`{user_id}`)"
+
+
+def ticket_status_color(ticket_type: str, *, status: str = "open", claimed_by: Optional[int] = None) -> discord.Color:
+    """Return the embed accent color for the live ticket card/events."""
+    clean_status = str(status or "open").lower().strip()
+    clean_type = str(ticket_type or "normal").lower().strip()
+
+    if clean_status == "closed":
+        return discord.Color(STARZ_COLOR_RED)
+    if claimed_by:
+        return discord.Color(STARZ_COLOR_GREEN)
+    if clean_status in {"ping", "attention"}:
+        return discord.Color(STARZ_COLOR_GOLD)
+    if clean_type == "priority":
+        return discord.Color(STARZ_COLOR_RED)
+    return discord.Color(STARZ_COLOR_BLUE)
+
+
+def build_ticket_status_embed(
+    *,
+    guild: discord.Guild,
+    ticket_number: str,
+    ticket_type: str,
+    owner_id: int,
+    claimed_by: Optional[int] = None,
+    status: str = "Open",
+    created_by_text: str = "",
+) -> discord.Embed:
+    """Build the colored ticket card shown at the top of each live ticket."""
+    clean_type = "priority" if str(ticket_type).lower() == "priority" else "normal"
+    is_priority = clean_type == "priority"
+    emoji = PRIORITY_TICKET_CONFIG["emoji"] if is_priority else TICKET_CONFIG["emoji"]
+    title = f"{emoji} {'Priority Ticket' if is_priority else 'Ticket'} #{ticket_number}"
+    description = (
+        "Thanks for opening a **priority** ticket. A higher-level staff member will help you soon."
+        if is_priority
+        else "Thanks for opening a ticket. A staff member will help you soon."
+    )
+    description += "\n\nUse **Ping Team** if you need staff attention."
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=ticket_status_color(clean_type, status=status, claimed_by=claimed_by),
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Ticket Number", value=f"`{ticket_number}`", inline=True)
+    embed.add_field(name="Ticket Type", value="Priority" if is_priority else "Normal", inline=True)
+    embed.add_field(name="Status", value=status, inline=True)
+
+    creator_value = created_by_text or format_user_reference(guild, owner_id)
+    embed.add_field(name="Created By", value=creator_value, inline=False)
+    embed.add_field(
+        name="Claimed By",
+        value=format_user_reference(guild, claimed_by) if claimed_by else "Not claimed yet",
+        inline=False,
+    )
+    embed.set_footer(text=f"Creator ID: {owner_id}")
+    return embed
+
+
+def build_ticket_event_embed(
+    *,
+    title: str,
+    description: str,
+    color: discord.Color,
+) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=color, timestamp=now_utc())
 
 
 def format_stat_time(value: Any) -> str:
@@ -1168,6 +1249,44 @@ async def fetch_member_safe(guild: discord.Guild, user_id: int) -> Optional[disc
         return await guild.fetch_member(user_id)
     except (discord.NotFound, discord.HTTPException):
         return None
+
+
+async def refresh_ticket_status_message(bot: "TicketBot", channel: discord.TextChannel, *, status: str = "Open") -> None:
+    """Edit the starter ticket card so its color/status stays current."""
+    owner_id = get_ticket_owner_id(channel) or 0
+    ticket_type = get_ticket_kind(channel)
+    ticket_number = get_ticket_number(channel)
+    claimed_by = get_claimed_by_id(channel)
+
+    embed = build_ticket_status_embed(
+        guild=channel.guild,
+        ticket_number=ticket_number,
+        ticket_type=ticket_type,
+        owner_id=owner_id,
+        claimed_by=claimed_by,
+        status=status,
+    )
+
+    bot_user_id = int(getattr(getattr(bot, "user", None), "id", 0) or 0)
+    try:
+        async for message in channel.history(limit=30, oldest_first=True):
+            if bot_user_id and int(getattr(message.author, "id", 0) or 0) != bot_user_id:
+                continue
+            if not message.embeds:
+                continue
+
+            for existing_embed in message.embeds:
+                field_names = {clean_transcript_text(getattr(field, "name", "")).lower() for field in existing_embed.fields}
+                has_ticket_number = any(
+                    clean_transcript_text(getattr(field, "name", "")).lower() == "ticket number"
+                    and ticket_number in clean_transcript_text(getattr(field, "value", ""))
+                    for field in existing_embed.fields
+                )
+                if has_ticket_number or {"ticket number", "ticket type", "claimed by"}.issubset(field_names):
+                    await message.edit(embed=embed, view=TicketChannelView(bot))
+                    return
+    except (discord.Forbidden, discord.HTTPException):
+        return
 
 
 async def get_ticket_category(
@@ -2603,27 +2722,15 @@ async def create_ticket_channel(
         reason="Set clean ticket channel name after create.",
     )
 
-    config = PRIORITY_TICKET_CONFIG if priority else TICKET_CONFIG
-    title_prefix = "Priority Ticket" if priority else config["label"]
-    description = (
-        "Thanks for opening a **priority** ticket. A higher-level staff member will help you soon.\n\n"
-        if priority
-        else "Thanks for opening a ticket. A staff member will help you soon.\n\n"
+    embed = build_ticket_status_embed(
+        guild=guild,
+        ticket_number=ticket_number,
+        ticket_type=ticket_type,
+        owner_id=interaction.user.id,
+        claimed_by=None,
+        status="Open",
+        created_by_text=f"{interaction.user.mention}\n`{interaction.user.id}`",
     )
-    description += "Use **Ping Team** if you need staff attention."
-
-    embed = discord.Embed(
-        title=f"{config['emoji']} {title_prefix}",
-        description=description,
-        color=discord.Color.red() if priority else discord.Color.blurple(),
-        timestamp=now_utc(),
-    )
-    embed.add_field(name="Ticket Number", value=f"`{ticket_number}`", inline=True)
-    embed.add_field(name="Ticket Type", value="Priority" if priority else "Normal", inline=True)
-    embed.add_field(name="Created By", value=f"{interaction.user.mention}\n`{interaction.user.id}`", inline=False)
-    embed.add_field(name="Status", value="Open", inline=True)
-    embed.add_field(name="Claimed By", value="Not claimed yet", inline=True)
-    embed.set_footer(text=f"Creator ID: {interaction.user.id}")
 
     opening_mentions = mention_roles(ping_roles) if ping_roles else None
 
@@ -3051,7 +3158,10 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
                 value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
                 inline=False,
             )
-        embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • Colored HTML + plain text transcripts attached")
+        footer_text = "Open the .html attachment for the colored transcript."
+        if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED:
+            footer_text += " Plain .txt fallback is also attached."
+        embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • {footer_text}")
 
         log_sent = False
         log_error = ""
@@ -3067,9 +3177,10 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
                         transcript_text,
                         page_title=f"STARZ Ticket #{ticket_number} Transcript",
                     )
-                    transcript_files.append(transcript_file_from_html(transcript_html, f"{safe_base_name}.html"))
+                    transcript_files.append(transcript_file_from_html(transcript_html, f"colored-{safe_base_name}.html"))
 
-                transcript_files.append(transcript_file_from_text(transcript_text, f"{safe_base_name}.txt"))
+                if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED or not transcript_files:
+                    transcript_files.append(transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"))
 
                 await log_channel.send(embed=embed, files=transcript_files)
                 log_sent = True
@@ -3094,7 +3205,12 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             return
 
         try:
-            await self.channel.send(f"🔒 Ticket closed by {interaction.user.mention}. Reason: {reason_text}")
+            close_notice = build_ticket_event_embed(
+                title="🔒 Ticket Closed",
+                description=f"Closed by {interaction.user.mention}.\n\n**Reason:** {truncate(reason_text, 900)}",
+                color=ticket_status_color(ticket_kind, status="closed"),
+            )
+            await self.channel.send(embed=close_notice)
         except discord.HTTPException:
             pass
 
@@ -3211,8 +3327,17 @@ class TicketChannelView(discord.ui.View):
             return
 
         self.bot.ticket_ping_cooldowns[channel.id] = now_utc()
+        ping_mentions = mention_roles(ping_roles)
+        ping_embed = build_ticket_event_embed(
+            title="📣 Staff Attention Requested",
+            description=f"{interaction.user.mention} requested staff attention for this ticket.",
+            color=ticket_status_color(get_ticket_kind(channel), status="ping"),
+        )
+        ping_embed.add_field(name="Requested By", value=f"{interaction.user.mention}\n`{interaction.user.id}`", inline=False)
+        ping_embed.add_field(name="Ping Roles", value=ping_mentions or "None", inline=False)
         await channel.send(
-            f"📣 {interaction.user.mention} requested staff attention: {mention_roles(ping_roles)}",
+            content=ping_mentions,
+            embed=ping_embed,
             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
         )
         await interaction.response.send_message("Pinged the configured ticket roles. This ticket can ping again in 10 minutes.", ephemeral=True)
@@ -3256,7 +3381,14 @@ class TicketChannelView(discord.ui.View):
             claimed_channel_name(interaction.user, channel),
             reason=f"Ticket claimed by {interaction.user} ({interaction.user.id})",
         )
-        await channel.send(f"📌 Ticket claimed by {interaction.user.mention} (`{interaction.user.id}`).")
+        await refresh_ticket_status_message(self.bot, channel, status="Claimed")
+        claim_embed = build_ticket_event_embed(
+            title="📌 Ticket Claimed",
+            description=f"{interaction.user.mention} claimed this ticket.",
+            color=ticket_status_color(get_ticket_kind(channel), status="claimed", claimed_by=interaction.user.id),
+        )
+        claim_embed.add_field(name="Claimed By", value=f"{interaction.user.mention}\n`{interaction.user.id}`", inline=False)
+        await channel.send(embed=claim_embed)
         await interaction.response.send_message("You claimed this ticket.", ephemeral=True)
 
     @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.secondary, custom_id="ticket:unclaim", row=0)
@@ -3300,7 +3432,14 @@ class TicketChannelView(discord.ui.View):
             ticket_base_channel_name(channel),
             reason=f"Ticket unclaimed by {interaction.user} ({interaction.user.id})",
         )
-        await channel.send(f"📌 Ticket unclaimed by {interaction.user.mention} (`{interaction.user.id}`).")
+        await refresh_ticket_status_message(self.bot, channel, status="Open")
+        unclaim_embed = build_ticket_event_embed(
+            title="📌 Ticket Unclaimed",
+            description=f"{interaction.user.mention} unclaimed this ticket.",
+            color=discord.Color(STARZ_COLOR_GRAY),
+        )
+        unclaim_embed.add_field(name="Unclaimed By", value=f"{interaction.user.mention}\n`{interaction.user.id}`", inline=False)
+        await channel.send(embed=unclaim_embed)
         await interaction.response.send_message("You unclaimed this ticket.", ephemeral=True)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="ticket:close", row=0)
