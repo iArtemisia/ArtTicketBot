@@ -1082,6 +1082,7 @@ def get_ticket_log_path(guild_id: int, ticket_id: str) -> Path:
 def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Optional[discord.abc.GuildChannel]) -> discord.Embed:
     config = bot.config_store.get_guild(guild.id)
     category = guild.get_channel(config.get("ticket_category_id", 0))
+    priority_category = guild.get_channel(config.get("priority_ticket_category_id", 0))
     log_channel = guild.get_channel(config.get("log_channel_id", 0))
 
     normal_staff_roles = get_staff_roles(bot, guild)
@@ -1100,7 +1101,12 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
         color=discord.Color.blurple(),
         timestamp=now_utc(),
     )
-    embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
+    embed.add_field(name="Normal ticket category", value=category.mention if category else "Not set", inline=False)
+    embed.add_field(
+        name="Priority ticket category",
+        value=priority_category.mention if isinstance(priority_category, discord.CategoryChannel) else "Using normal ticket category",
+        inline=False,
+    )
     embed.add_field(name="Closed-ticket log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
     embed.add_field(name="Next ticket number", value=f"`{bot.config_store.peek_next_ticket_number(guild.id)}`", inline=False)
     embed.add_field(
@@ -1160,10 +1166,51 @@ async def fetch_member_safe(guild: discord.Guild, user_id: int) -> Optional[disc
         return None
 
 
-async def get_ticket_category(bot: "TicketBot", guild: discord.Guild) -> Optional[discord.CategoryChannel]:
+async def get_ticket_category(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    *,
+    priority: bool = False,
+) -> Optional[discord.CategoryChannel]:
+    """Return the correct category for normal or priority tickets.
+
+    Normal tickets use ticket_category_id. Priority tickets can use
+    priority_ticket_category_id. If no priority category is configured,
+    priority tickets fall back to the normal ticket category so existing
+    setups keep working until an admin runs `/ticket prioritycategory`.
+    """
     config = bot.config_store.get_guild(guild.id)
-    channel = guild.get_channel(config.get("ticket_category_id", 0))
+    category_id = 0
+    if priority:
+        try:
+            category_id = int(config.get("priority_ticket_category_id", 0) or 0)
+        except (TypeError, ValueError):
+            category_id = 0
+
+    if not category_id:
+        try:
+            category_id = int(config.get("ticket_category_id", 0) or 0)
+        except (TypeError, ValueError):
+            category_id = 0
+
+    channel = guild.get_channel(category_id)
     return channel if isinstance(channel, discord.CategoryChannel) else None
+
+
+async def get_ticket_lookup_categories(bot: "TicketBot", guild: discord.Guild) -> list[discord.CategoryChannel]:
+    """Return all configured ticket categories, de-duplicated.
+
+    This lets the bot keep the one-open-ticket rule even after normal and
+    priority tickets are separated into different categories.
+    """
+    categories: list[discord.CategoryChannel] = []
+    seen: set[int] = set()
+    for priority in (False, True):
+        category = await get_ticket_category(bot, guild, priority=priority)
+        if category is not None and category.id not in seen:
+            seen.add(category.id)
+            categories.append(category)
+    return categories
 
 
 async def get_log_channel(bot: "TicketBot", guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -1191,11 +1238,16 @@ def member_is_staff(bot: "TicketBot", member: discord.Member) -> bool:
     return bool(configured_roles & member_role_ids)
 
 
-def find_open_ticket_for_user(category: discord.CategoryChannel, user_id: int) -> Optional[discord.TextChannel]:
-    for channel in category.text_channels:
-        data = parse_ticket_topic(channel.topic)
-        if data.get("ticket_owner") == str(user_id) and data.get("status") == "open":
-            return channel
+def find_open_ticket_for_user(
+    categories: discord.CategoryChannel | list[discord.CategoryChannel],
+    user_id: int,
+) -> Optional[discord.TextChannel]:
+    search_categories = categories if isinstance(categories, list) else [categories]
+    for category in search_categories:
+        for channel in category.text_channels:
+            data = parse_ticket_topic(channel.topic)
+            if data.get("ticket_owner") == str(user_id) and data.get("status") == "open":
+                return channel
     return None
 
 
@@ -1764,11 +1816,14 @@ async def create_ticket_channel(
         role_list = ", ".join(role.mention for role in allowed_roles) if allowed_roles else "No priority opener roles are configured yet."
         return None, f"You do not have the required role to open a priority ticket.\nRequired role(s): {role_list}"
 
-    category = await get_ticket_category(bot, interaction.guild)
+    category = await get_ticket_category(bot, interaction.guild, priority=priority)
     if category is None:
-        return None, "The configured ticket category no longer exists. Run /ticket setup again."
+        if priority:
+            return None, "The configured priority ticket category no longer exists. Run `/ticket prioritycategory` or `/ticket setup` again."
+        return None, "The configured normal ticket category no longer exists. Run `/ticket setup` again."
 
-    existing = find_open_ticket_for_user(category, interaction.user.id)
+    lookup_categories = await get_ticket_lookup_categories(bot, interaction.guild)
+    existing = find_open_ticket_for_user(lookup_categories or [category], interaction.user.id)
     if existing:
         return existing, f"You already have an open ticket: {existing.mention}"
 
@@ -2205,6 +2260,7 @@ class AdminPanelGifModal(discord.ui.Modal, title="Set Panel GIF or Image"):
         self.bot.config_store.update_guild(
             interaction.guild.id,
             ticket_category_id=current.get("ticket_category_id"),
+            priority_ticket_category_id=current.get("priority_ticket_category_id"),
             log_channel_id=current.get("log_channel_id"),
             staff_role_ids=current.get("staff_role_ids", []),
             ping_role_ids=current.get("ping_role_ids", []),
@@ -2810,6 +2866,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         config = self.bot.config_store.update_guild(
             interaction.guild.id,
             ticket_category_id=real_category.id,
+            priority_ticket_category_id=current.get("priority_ticket_category_id", 0),
             log_channel_id=real_log_channel.id,
             staff_role_ids=current.get("staff_role_ids", []),
             ping_role_ids=current.get("ping_role_ids", []),
@@ -2822,11 +2879,20 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             notes_thread_ids=current.get("notes_thread_ids", {}),
         )
 
+        saved_priority_category = interaction.guild.get_channel(config.get("priority_ticket_category_id", 0))
+        priority_category_text = (
+            saved_priority_category.mention
+            if isinstance(saved_priority_category, discord.CategoryChannel)
+            else "Using normal ticket category"
+        )
+
         await interaction.response.send_message(
             (
                 "Saved ticket setup for this server.\n\n"
-                f"**Ticket category:** {real_category.name}\n"
-                "Used for newly created private ticket channels.\n\n"
+                f"**Normal ticket category:** {real_category.name}\n"
+                "Used for newly created normal/private ticket channels.\n\n"
+                f"**Priority ticket category:** {priority_category_text}\n"
+                "Run `/ticket prioritycategory` to place priority tickets in a separate category.\n\n"
                 f"**Closed-ticket log channel:** {real_log_channel.mention}\n"
                 "Used when tickets close. The transcript file will be posted there automatically.\n\n"
                 f"**Normal access roles configured:** {len(config.get('staff_role_ids', []))}\n"
@@ -2835,6 +2901,66 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 "Run `/ticket admin` to configure pings/access with dropdowns.\n"
                 "Run `/ticket panel` in the channel where you want the ticket embed posted."
             ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="prioritycategory", description="Set a separate category for priority tickets.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(category="Category where priority ticket channels will be created")
+    async def set_priority_category(
+        self,
+        interaction: discord.Interaction,
+        category: discord.app_commands.AppCommandChannel,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        try:
+            real_category = category.resolve() or await category.fetch()
+        except discord.HTTPException:
+            real_category = None
+
+        if not isinstance(real_category, discord.CategoryChannel):
+            picked_type = getattr(category, "type", "unknown")
+            await interaction.response.send_message(
+                (
+                    "The **category** option must be a real Discord category.\n"
+                    "This is where priority ticket channels get created.\n\n"
+                    f"You picked: {category.mention} (`{picked_type}`)"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        self.bot.config_store.update_guild(
+            interaction.guild.id,
+            priority_ticket_category_id=real_category.id,
+        )
+
+        await interaction.response.send_message(
+            (
+                "Saved the separate priority ticket category.\n\n"
+                f"**Priority tickets** will now be created in: {real_category.mention}\n"
+                "**Normal tickets** will still use the normal ticket category from `/ticket setup`."
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="clearprioritycategory", description="Make priority tickets use the normal ticket category again.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def clear_priority_category(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        self.bot.config_store.update_guild(
+            interaction.guild.id,
+            priority_ticket_category_id=0,
+        )
+
+        await interaction.response.send_message(
+            "Priority tickets will now use the normal ticket category again.",
             ephemeral=True,
         )
 
@@ -3055,11 +3181,17 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         config = self.bot.config_store.get_guild(interaction.guild.id)
         category = interaction.guild.get_channel(config.get("ticket_category_id", 0))
+        priority_category = interaction.guild.get_channel(config.get("priority_ticket_category_id", 0))
         log_channel = interaction.guild.get_channel(config.get("log_channel_id", 0))
         panel_url = get_panel_gif_url(self.bot, interaction.guild.id) or "Not set"
 
         embed = discord.Embed(title="Ticket Configuration", color=discord.Color.blurple())
-        embed.add_field(name="Ticket category", value=category.mention if category else "Not set", inline=False)
+        embed.add_field(name="Normal ticket category", value=category.mention if category else "Not set", inline=False)
+        embed.add_field(
+            name="Priority ticket category",
+            value=priority_category.mention if isinstance(priority_category, discord.CategoryChannel) else "Using normal ticket category",
+            inline=False,
+        )
         embed.add_field(name="Closed-ticket log channel", value=log_channel.mention if log_channel else "Not set", inline=False)
         embed.add_field(name="Next ticket number", value=f"`{self.bot.config_store.peek_next_ticket_number(interaction.guild.id)}`", inline=False)
         embed.add_field(name="Staff role dropdown filter", value=format_role_list(get_staff_filter_roles(self.bot, interaction.guild)), inline=False)
@@ -3158,7 +3290,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         elif isinstance(error, app_commands.TransformerError):
             message = (
                 "A selected option could not be read correctly.\n\n"
-                "For `/ticket setup`:\n"
+                "For `/ticket setup` and `/ticket prioritycategory`:\n"
                 "- `category` must be a real Discord category\n"
                 "- `log_channel` must be a normal text channel for closed ticket logs/transcripts"
             )
