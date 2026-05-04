@@ -22,6 +22,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRANSCRIPT_ASCII_SAFE = os.getenv("TRANSCRIPT_ASCII_SAFE", "true").strip().lower() not in {"0", "false", "no", "off"}
+TRANSCRIPT_INCLUDE_BOT_EVENTS = os.getenv("TRANSCRIPT_INCLUDE_BOT_EVENTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
@@ -1415,6 +1416,10 @@ def format_transcript_author(message: discord.Message) -> str:
     username = clean_transcript_text(getattr(author, "name", None) or str(author))
     user_id = getattr(author, "id", 0)
 
+    # Discord sometimes gives a generic fallback like "User 123..." when a
+    # member is not cached. Prefer the actual username when it is available.
+    if display_name.lower().startswith("user ") and username and not username.lower().startswith("user "):
+        return f"@{username} ({user_id})"
     if username and display_name and username.lower() != display_name.lower():
         return f"{display_name} (@{username} | {user_id})"
     if display_name:
@@ -1681,6 +1686,82 @@ def append_attachment_index(
     lines.append("")
 
 
+def audit_field_value(audit_text: str, label: str, default: str = "None") -> str:
+    """Pull one value out of the audit text without printing the whole audit block."""
+    pattern = rf"^{re.escape(label)}\s*:\s*(.*?)\s*$"
+    match = re.search(pattern, audit_text or "", flags=re.MULTILINE)
+    if not match:
+        return default
+    value = clean_transcript_text(match.group(1))
+    return value or default
+
+
+def has_transcript_attachments(
+    ticket_messages: list[discord.Message],
+    notes_messages_by_source: list[tuple[discord.abc.GuildChannel, list[discord.Message]]],
+) -> bool:
+    for message in ticket_messages:
+        if getattr(message, "attachments", None):
+            return True
+    for _, note_messages in notes_messages_by_source:
+        for message in note_messages:
+            if getattr(message, "attachments", None):
+                return True
+    return False
+
+
+def participant_count(
+    ticket_messages: list[discord.Message],
+    notes_messages_by_source: list[tuple[discord.abc.GuildChannel, list[discord.Message]]],
+) -> int:
+    ids: set[int] = set()
+    for message in ticket_messages:
+        if not is_transcript_event_message(message):
+            user_id = int(getattr(message.author, "id", 0) or 0)
+            if user_id:
+                ids.add(user_id)
+    for _, note_messages in notes_messages_by_source:
+        for message in note_messages:
+            if not is_transcript_event_message(message):
+                user_id = int(getattr(message.author, "id", 0) or 0)
+                if user_id:
+                    ids.add(user_id)
+    return len(ids)
+
+
+def append_compact_ticket_header(
+    lines: list[str],
+    *,
+    channel: discord.TextChannel,
+    ticket_number: str,
+    ticket_kind: str,
+    owner_id: Optional[int],
+    claimed_by: Optional[int],
+    audit_text: str,
+    generated_at: str,
+) -> None:
+    """Single source of ticket metadata so transcripts do not repeat themselves."""
+    closed_by = audit_field_value(audit_text, "Closed By")
+    opened_at = audit_field_value(audit_text, "Opened At")
+    closed_at = audit_field_value(audit_text, "Closed At")
+    close_reason = audit_field_value(audit_text, "Close Reason")
+
+    lines.append(transcript_line("="))
+    lines.append(f"STARZ TICKET #{ticket_number} TRANSCRIPT")
+    lines.append(transcript_line("="))
+    lines.append(f"Ticket   : #{ticket_number} - {ticket_kind}")
+    lines.append(f"Channel  : #{clean_transcript_text(channel.name)} ({channel.id})")
+    lines.append(f"Owner    : {format_user_reference(channel.guild, owner_id)}")
+    lines.append(f"Claimed  : {format_user_reference(channel.guild, claimed_by)}")
+    lines.append(f"Closed By: {closed_by}")
+    lines.append(f"Reason   : {close_reason}")
+    if opened_at != "None" or closed_at != "None":
+        lines.append(f"Times    : Opened {opened_at} | Closed {closed_at}")
+    lines.append(f"Generated: {generated_at}")
+    lines.append(transcript_line("="))
+    lines.append("")
+
+
 async def build_ticket_and_notes_transcript_text(
     channel: discord.TextChannel,
     notes_thread: Optional[discord.abc.GuildChannel] = None,
@@ -1728,48 +1809,34 @@ async def build_ticket_and_notes_transcript_text(
 
     ticket_events = [message for message in ticket_messages if is_transcript_event_message(message)]
     ticket_conversation = [message for message in ticket_messages if not is_transcript_event_message(message)]
+    visible_notes = [
+        (notes_source, [message for message in note_messages if not is_transcript_event_message(message)])
+        for notes_source, note_messages in notes_messages_by_source
+    ]
+    has_notes = any(note_messages for _, note_messages in visible_notes) or bool(notes_read_errors)
 
-    lines.append(transcript_line("="))
-    lines.append(f"STARZ TICKET #{ticket_number} TRANSCRIPT")
-    lines.append(transcript_line("="))
-    lines.append(f"Type       : {ticket_kind}")
-    lines.append(f"Channel    : #{clean_transcript_text(channel.name)} ({channel.id})")
-    lines.append(f"Owner      : {format_user_reference(channel.guild, owner_id)}")
-    lines.append(f"Claimed By : {format_user_reference(channel.guild, claimed_by)}")
-    lines.append(f"Generated  : {generated_at}")
-    lines.append(transcript_line("="))
-    lines.append("")
-    lines.append("READING NOTES")
-    lines.append("- Bot/system messages are separated into TICKET EVENTS so the conversation is easier to follow.")
-    lines.append("- Staff notes are separated from the public ticket conversation.")
-    lines.append("- Attachments are shown inline and also indexed in EVIDENCE / ATTACHMENTS.")
-    lines.append("- Text is saved in an ASCII-safe format by default to avoid Discord preview mojibake.")
-    lines.append("")
-
-    if audit_text:
-        append_transcript_section(lines, "Ticket Summary")
-        append_indented_text(lines, audit_text, indent="  ", empty="No audit data available.")
-
-    append_participants_section(
+    append_compact_ticket_header(
         lines,
+        channel=channel,
+        ticket_number=ticket_number,
+        ticket_kind=ticket_kind,
         owner_id=owner_id,
-        ticket_messages=ticket_messages,
-        notes_messages_by_source=notes_messages_by_source,
+        claimed_by=claimed_by,
+        audit_text=audit_text,
+        generated_at=generated_at,
     )
 
-    append_transcript_section(lines, "Ticket Events")
-    if ticket_read_error:
-        lines.append(ticket_read_error)
-        lines.append("")
-    else:
-        append_messages_grouped_by_day(
+    # Show participants only when it helps review the ticket. For one-person test
+    # tickets this section just repeats the header, so it is skipped.
+    if participant_count(ticket_messages, notes_messages_by_source) > 1:
+        append_participants_section(
             lines,
-            ticket_events,
-            empty_text="No bot/system ticket events were found.",
-            compact_embeds=True,
+            owner_id=owner_id,
+            ticket_messages=ticket_messages,
+            notes_messages_by_source=notes_messages_by_source,
         )
 
-    append_transcript_section(lines, "Ticket Conversation")
+    append_transcript_section(lines, "Conversation")
     if ticket_read_error:
         lines.append(ticket_read_error)
         lines.append("")
@@ -1781,26 +1848,18 @@ async def build_ticket_and_notes_transcript_text(
             compact_embeds=True,
         )
 
-    append_attachment_index(
-        lines,
-        ticket_messages=ticket_messages,
-        notes_messages_by_source=notes_messages_by_source,
-    )
-
-    append_transcript_section(lines, "Staff Notes")
-    if not notes_sources:
-        lines.append("No staff notes thread was linked to this ticket.")
-        lines.append("")
-    else:
+    if has_notes:
+        append_transcript_section(lines, "Staff Notes")
         for error in notes_read_errors:
             lines.append(error)
         if notes_read_errors:
             lines.append("")
 
-        for notes_source, note_messages in notes_messages_by_source:
+        for notes_source, staff_note_messages in visible_notes:
+            if not staff_note_messages:
+                continue
             source_type = "Private Thread" if isinstance(notes_source, discord.Thread) else "Legacy Notes Channel"
             append_transcript_subsection(lines, f"{source_type}: #{clean_transcript_text(getattr(notes_source, 'name', 'notes'))} ({notes_source.id})")
-            staff_note_messages = [message for message in note_messages if not is_transcript_event_message(message)]
             append_messages_grouped_by_day(
                 lines,
                 staff_note_messages,
@@ -1808,8 +1867,28 @@ async def build_ticket_and_notes_transcript_text(
                 compact_embeds=True,
             )
 
-    append_transcript_section(lines, "End Of Transcript")
-    lines.append(f"Generated by STARZ ticket bot at {generated_at}.")
+    if has_transcript_attachments(ticket_messages, notes_messages_by_source):
+        append_attachment_index(
+            lines,
+            ticket_messages=ticket_messages,
+            notes_messages_by_source=notes_messages_by_source,
+        )
+
+    # Bot/system events are usually duplicate noise, so they are hidden by default.
+    # Set TRANSCRIPT_INCLUDE_BOT_EVENTS=true if you want the opener/ping/claim bot
+    # messages included near the bottom of future transcripts.
+    if TRANSCRIPT_INCLUDE_BOT_EVENTS and ticket_events:
+        append_transcript_section(lines, "Bot / System Events")
+        append_messages_grouped_by_day(
+            lines,
+            ticket_events,
+            empty_text="No bot/system ticket events were found.",
+            compact_embeds=True,
+        )
+
+    lines.append(transcript_line("="))
+    lines.append("END OF TRANSCRIPT")
+    lines.append(transcript_line("="))
     return "\n".join(lines)
 
 
@@ -2591,26 +2670,28 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         ticket_stats = self.bot.stats_store.get_ticket(interaction.guild.id, self.channel.id)
         log_channel = await get_log_channel(self.bot, interaction.guild)
         closed_at = now_utc()
-        embed = discord.Embed(title="Ticket Closed", color=discord.Color.red(), timestamp=closed_at)
-        embed.add_field(name="Ticket Number", value=f"`{ticket_number}`", inline=True)
-        embed.add_field(name="Ticket ID / Channel ID", value=f"`{ticket_log_id}`", inline=True)
-        embed.add_field(name="Ticket Type", value=ticket_kind.title(), inline=True)
-        embed.add_field(name="Created By", value=format_user_reference(interaction.guild, owner_id), inline=False)
-        embed.add_field(name="Claimed By", value=format_user_reference(interaction.guild, claimed_by if claimed_by else None), inline=False)
-        embed.add_field(name="Closed By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
-        embed.add_field(name="Close Reason", value=truncate(reason_text, 1024), inline=False)
-        embed.add_field(name="Closed At", value=closed_at.strftime("%Y-%m-%d %H:%M:%S UTC"), inline=False)
-        embed.add_field(
-            name="Staff Notes",
-            value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
-            inline=False,
+        embed = discord.Embed(title=f"Ticket #{ticket_number} Closed", color=discord.Color.red(), timestamp=closed_at)
+        embed.description = (
+            f"**Type:** {ticket_kind.title()}\n"
+            f"**Channel ID:** `{ticket_log_id}`\n"
+            f"**Reason:** {truncate(reason_text, 900)}"
         )
         embed.add_field(
-            name="Staff Activity",
-            value=build_staff_activity_embed_value(interaction.guild, ticket_stats),
+            name="People",
+            value=(
+                f"**Opened by:** {format_user_reference(interaction.guild, owner_id)}\n"
+                f"**Claimed by:** {format_user_reference(interaction.guild, claimed_by if claimed_by else None)}\n"
+                f"**Closed by:** {interaction.user.mention} (`{interaction.user.id}`)"
+            ),
             inline=False,
         )
-        embed.set_footer(text="Transcript file includes ticket conversation, staff notes, and ticket audit stats when available.")
+        if notes_thread is not None or legacy_notes_channels:
+            embed.add_field(
+                name="Staff Notes",
+                value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
+                inline=False,
+            )
+        embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • Transcript attached")
 
         log_sent = False
         log_error = ""
