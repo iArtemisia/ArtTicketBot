@@ -1406,30 +1406,174 @@ def is_transcript_event_message(message: discord.Message) -> bool:
     return message_type != discord.MessageType.default
 
 
-def format_transcript_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
-    """Format users in transcript/log review text without Discord mentions.
+def is_generic_transcript_name(value: Any, user_id: Optional[int] = None) -> bool:
+    """Return True for Discord fallback names like `User 123...`."""
+    clean_value = clean_transcript_text(value).strip()
+    if not clean_value:
+        return True
 
-    Mentions like <@123> are noisy in transcript files and Discord previews. This
-    keeps the readable Discord display name while preserving the Discord ID for
-    follow-up or moderation lookups.
+    lowered = clean_value.lower()
+    if lowered in {"unknown", "unknown user", "none"}:
+        return True
+
+    if user_id:
+        raw_id = str(int(user_id))
+        generic_values = {
+            raw_id,
+            f"user {raw_id}",
+            f"unknown user {raw_id}",
+            f"unknown user - {raw_id}",
+        }
+        if lowered in generic_values:
+            return True
+        if lowered.startswith("user ") and raw_id in lowered:
+            return True
+
+    return False
+
+
+def build_user_lookup_entry(*, user_id: int, display_name: Any = "", username: Any = "") -> Optional[dict[str, str]]:
+    """Create consistent transcript labels from a Discord display name + username."""
+    display = clean_transcript_text(display_name)
+    user = clean_transcript_text(username)
+
+    if is_generic_transcript_name(display, user_id):
+        display = ""
+    if is_generic_transcript_name(user, user_id):
+        user = ""
+
+    # Prefer a real display name, then username, then a clear ID fallback.
+    primary = display or (f"@{user}" if user else "")
+    if not primary:
+        return None
+
+    if user and display and user.lower() != display.lower():
+        header = f"{display} (@{user}) - {user_id}"
+        line = f"{display} (@{user} | {user_id})"
+        participant = f"{display} (@{user}) - {user_id}"
+    elif user and not display:
+        header = f"@{user} - {user_id}"
+        line = f"@{user} ({user_id})"
+        participant = f"@{user} - {user_id}"
+    else:
+        header = f"{primary} - {user_id}"
+        line = f"{primary} ({user_id})"
+        participant = f"{primary} - {user_id}"
+
+    return {"header": header, "line": line, "participant": participant, "name": display or user, "username": user}
+
+
+def user_lookup_entry_from_author(author: Any) -> Optional[dict[str, str]]:
+    try:
+        user_id = int(getattr(author, "id", 0) or 0)
+    except (TypeError, ValueError):
+        user_id = 0
+    if not user_id:
+        return None
+
+    display_name = (
+        getattr(author, "display_name", None)
+        or getattr(author, "global_name", None)
+        or getattr(author, "name", None)
+        or str(author)
+    )
+    username = getattr(author, "name", None) or ""
+    return build_user_lookup_entry(user_id=user_id, display_name=display_name, username=username)
+
+
+def user_lookup_entry_from_member(member: discord.abc.User) -> Optional[dict[str, str]]:
+    user_id = int(getattr(member, "id", 0) or 0)
+    if not user_id:
+        return None
+
+    display_name = (
+        getattr(member, "display_name", None)
+        or getattr(member, "global_name", None)
+        or getattr(member, "name", None)
+        or str(member)
+    )
+    username = getattr(member, "name", None) or ""
+    return build_user_lookup_entry(user_id=user_id, display_name=display_name, username=username)
+
+
+async def build_transcript_user_lookup(
+    guild: discord.Guild,
+    user_ids: set[int],
+    messages: list[discord.Message],
+) -> dict[int, dict[str, str]]:
+    """Build a best-effort user directory so transcripts show names, not raw IDs.
+
+    Discord sometimes gives the transcript builder only a generic user stub such
+    as `User 123456789`. This lookup first uses authors from message history,
+    then falls back to the guild cache, and finally tries a Discord REST fetch.
     """
+    lookup: dict[int, dict[str, str]] = {}
+
+    for message in messages:
+        author = getattr(message, "author", None)
+        entry = user_lookup_entry_from_author(author)
+        if not entry:
+            continue
+        user_id = int(getattr(author, "id", 0) or 0)
+        if user_id and user_id not in lookup:
+            lookup[user_id] = entry
+        if user_id:
+            user_ids.add(user_id)
+
+    for raw_user_id in list(user_ids):
+        try:
+            user_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            continue
+        if not user_id:
+            continue
+
+        existing = lookup.get(user_id)
+        if existing and not is_generic_transcript_name(existing.get("name", ""), user_id):
+            continue
+
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+
+        if member is not None:
+            entry = user_lookup_entry_from_member(member)
+            if entry:
+                lookup[user_id] = entry
+
+    return lookup
+
+
+def format_transcript_user_reference(
+    guild: discord.Guild,
+    user_id: Optional[int],
+    user_lookup: Optional[dict[int, dict[str, str]]] = None,
+) -> str:
+    """Format users in transcript/log review text without Discord mentions."""
     if not user_id:
         return "None"
 
-    member = guild.get_member(int(user_id))
+    clean_id = int(user_id)
+    if user_lookup and clean_id in user_lookup:
+        return user_lookup[clean_id].get("header") or user_lookup[clean_id].get("participant") or f"User {clean_id} - {clean_id}"
+
+    member = guild.get_member(clean_id)
     if member is not None:
-        display_name = clean_transcript_text(getattr(member, "display_name", None) or getattr(member, "name", None) or str(member))
-        username = clean_transcript_text(getattr(member, "name", None) or str(member))
-        if display_name and username and display_name.lower() != username.lower():
-            return f"{display_name} (@{username}) - {member.id}"
-        if display_name:
-            return f"{display_name} - {member.id}"
-        return f"User {member.id} - {member.id}"
+        entry = user_lookup_entry_from_member(member)
+        if entry:
+            return entry["header"]
 
-    return f"Unknown User - {int(user_id)}"
+    return f"User {clean_id} - {clean_id}"
 
 
-def format_transcript_user_value(guild: discord.Guild, raw_value: Any) -> str:
+def format_transcript_user_value(
+    guild: discord.Guild,
+    raw_value: Any,
+    user_lookup: Optional[dict[int, dict[str, str]]] = None,
+) -> str:
     """Convert a mention-like audit value into transcript-friendly name + ID text."""
     value = clean_transcript_text(raw_value)
     if not value or value == "None":
@@ -1437,27 +1581,26 @@ def format_transcript_user_value(guild: discord.Guild, raw_value: Any) -> str:
 
     user_id = extract_id(value)
     if user_id is not None:
-        return format_transcript_user_reference(guild, user_id)
+        return format_transcript_user_reference(guild, user_id, user_lookup)
 
     return value
 
 
-def format_transcript_author(message: discord.Message) -> str:
+def format_transcript_author(
+    message: discord.Message,
+    user_lookup: Optional[dict[int, dict[str, str]]] = None,
+) -> str:
     author = message.author
-    display_name = clean_transcript_text(getattr(author, "display_name", None) or getattr(author, "name", None) or str(author))
-    username = clean_transcript_text(getattr(author, "name", None) or str(author))
-    user_id = getattr(author, "id", 0)
+    user_id = int(getattr(author, "id", 0) or 0)
 
-    # Discord sometimes gives a generic fallback like "User 123..." when a
-    # member is not cached. Prefer the actual username when it is available.
-    if display_name.lower().startswith("user ") and username and not username.lower().startswith("user "):
-        return f"@{username} ({user_id})"
-    if username and display_name and username.lower() != display_name.lower():
-        return f"{display_name} (@{username} | {user_id})"
-    if display_name:
-        return f"{display_name} ({user_id})"
-    return f"User {user_id}"
+    if user_lookup and user_id in user_lookup:
+        return user_lookup[user_id].get("line") or user_lookup[user_id].get("header") or f"User {user_id}"
 
+    entry = user_lookup_entry_from_author(author)
+    if entry:
+        return entry["line"]
+
+    return f"User {user_id}" if user_id else "Unknown User"
 
 def compact_one_line(value: Any, limit: int = 180) -> str:
     clean_value = clean_transcript_text(value).replace("\n", " / ")
@@ -1542,6 +1685,7 @@ def append_messages_grouped_by_day(
     *,
     empty_text: str,
     compact_embeds: bool = True,
+    user_lookup: Optional[dict[int, dict[str, str]]] = None,
 ) -> int:
     if not messages:
         lines.append(empty_text)
@@ -1559,7 +1703,7 @@ def append_messages_grouped_by_day(
             append_transcript_subsection(lines, day_label)
 
         time_label = created.strftime("%H:%M UTC")
-        author = format_transcript_author(message)
+        author = format_transcript_author(message, user_lookup)
         lines.append(f"[{time_label}] {author}")
 
         content = get_message_text_for_transcript(message)
@@ -1655,6 +1799,7 @@ def append_participants_section(
     owner_id: Optional[int],
     ticket_messages: list[discord.Message],
     notes_messages_by_source: list[tuple[discord.abc.GuildChannel, list[discord.Message]]],
+    user_lookup: Optional[dict[int, dict[str, str]]] = None,
 ) -> None:
     combined: dict[int, dict[str, Any]] = {}
     merge_participant_counts(combined, collect_participant_counts(ticket_messages), notes=False)
@@ -1673,12 +1818,15 @@ def append_participants_section(
         role = "Owner" if user_id == owner_id else "Staff/User"
         msg_count = int(item.get("messages", 0))
         note_count = int(item.get("notes", 0))
-        name = clean_transcript_text(item.get("name", f"User {user_id}")) or f"User {user_id}"
-        username = clean_transcript_text(item.get("username", ""))
-        user_text = f"{name}"
-        if username and username.lower() != name.lower():
-            user_text += f" (@{username})"
-        user_text += f" - {user_id}"
+        lookup_entry = (user_lookup or {}).get(user_id, {})
+        user_text = lookup_entry.get("participant")
+        if not user_text:
+            name = clean_transcript_text(item.get("name", f"User {user_id}")) or f"User {user_id}"
+            username = clean_transcript_text(item.get("username", ""))
+            user_text = f"{name}"
+            if username and username.lower() != name.lower():
+                user_text += f" (@{username})"
+            user_text += f" - {user_id}"
         lines.append(f"{role:<10}  {msg_count:<8}  {note_count:<5}  {user_text}")
     lines.append("")
 
@@ -1688,6 +1836,7 @@ def append_attachment_index(
     *,
     ticket_messages: list[discord.Message],
     notes_messages_by_source: list[tuple[discord.abc.GuildChannel, list[discord.Message]]],
+    user_lookup: Optional[dict[int, dict[str, str]]] = None,
 ) -> None:
     items: list[tuple[str, discord.Message, Any]] = []
     for message in ticket_messages:
@@ -1712,7 +1861,7 @@ def append_attachment_index(
         size = getattr(attachment, "size", 0) or 0
         size_text = f"{size:,} bytes" if size else "unknown size"
         lines.append(f"{index}. {filename} ({size_text})")
-        lines.append(f"   Posted: {created} by {format_transcript_author(message)}")
+        lines.append(f"   Posted: {created} by {format_transcript_author(message, user_lookup)}")
         lines.append(f"   Source: {source_label}")
         lines.append(f"   Link  : {attachment.url}")
     lines.append("")
@@ -1771,24 +1920,26 @@ def append_compact_ticket_header(
     claimed_by: Optional[int],
     audit_text: str,
     generated_at: str,
+    user_lookup: Optional[dict[int, dict[str, str]]] = None,
 ) -> None:
     """Single source of ticket metadata so transcripts do not repeat themselves."""
-    closed_by = format_transcript_user_value(channel.guild, audit_field_value(audit_text, "Closed By"))
+    closed_by = format_transcript_user_value(channel.guild, audit_field_value(audit_text, "Closed By"), user_lookup)
     opened_at = audit_field_value(audit_text, "Opened At")
     closed_at = audit_field_value(audit_text, "Closed At")
     close_reason = audit_field_value(audit_text, "Close Reason")
 
     lines.append(f"STARZ Ticket #{ticket_number} Transcript")
-    lines.append(transcript_line("-"))
+    lines.append("")
     lines.append(f"Ticket   : #{ticket_number} - {ticket_kind}")
     lines.append(f"Channel  : #{clean_transcript_text(channel.name)} ({channel.id})")
-    lines.append(f"Owner    : {format_transcript_user_reference(channel.guild, owner_id)}")
-    lines.append(f"Claimed  : {format_transcript_user_reference(channel.guild, claimed_by)}")
+    lines.append(f"Owner    : {format_transcript_user_reference(channel.guild, owner_id, user_lookup)}")
+    lines.append(f"Claimed  : {format_transcript_user_reference(channel.guild, claimed_by, user_lookup)}")
     lines.append(f"Closed By: {closed_by}")
     lines.append(f"Reason   : {close_reason}")
-    if opened_at != "None" or closed_at != "None":
-        lines.append(f"Times    : Opened {opened_at} | Closed {closed_at}")
-    lines.append(f"Generated: {generated_at}")
+    if opened_at != "None":
+        lines.append(f"Opened   : {opened_at}")
+    if closed_at != "None":
+        lines.append(f"Closed   : {closed_at}")
     lines.append("")
 
 
@@ -1837,6 +1988,17 @@ async def build_ticket_and_notes_transcript_text(
             notes_read_errors.append(f"Unable to read staff notes from #{getattr(notes_source, 'name', 'notes')} from Discord.")
         notes_messages_by_source.append((notes_source, note_messages))
 
+    all_transcript_messages: list[discord.Message] = list(ticket_messages)
+    for _, note_messages in notes_messages_by_source:
+        all_transcript_messages.extend(note_messages)
+
+    lookup_ids: set[int] = set()
+    for possible_id in (owner_id, claimed_by, extract_id(audit_field_value(audit_text, "Closed By"))):
+        if possible_id:
+            lookup_ids.add(int(possible_id))
+
+    user_lookup = await build_transcript_user_lookup(channel.guild, lookup_ids, all_transcript_messages)
+
     ticket_events = [message for message in ticket_messages if is_transcript_event_message(message)]
     ticket_conversation = [message for message in ticket_messages if not is_transcript_event_message(message)]
     visible_notes = [
@@ -1854,6 +2016,7 @@ async def build_ticket_and_notes_transcript_text(
         claimed_by=claimed_by,
         audit_text=audit_text,
         generated_at=generated_at,
+        user_lookup=user_lookup,
     )
 
     # Show participants only when it helps review the ticket. For one-person test
@@ -1864,6 +2027,7 @@ async def build_ticket_and_notes_transcript_text(
             owner_id=owner_id,
             ticket_messages=ticket_messages,
             notes_messages_by_source=notes_messages_by_source,
+            user_lookup=user_lookup,
         )
 
     append_transcript_section(lines, "Conversation")
@@ -1876,6 +2040,7 @@ async def build_ticket_and_notes_transcript_text(
             ticket_conversation,
             empty_text="No user/staff conversation messages were found.",
             compact_embeds=True,
+            user_lookup=user_lookup,
         )
 
     if has_notes:
@@ -1895,6 +2060,7 @@ async def build_ticket_and_notes_transcript_text(
                 staff_note_messages,
                 empty_text="No written staff notes were posted in this notes source.",
                 compact_embeds=True,
+                user_lookup=user_lookup,
             )
 
     if has_transcript_attachments(ticket_messages, notes_messages_by_source):
@@ -1902,6 +2068,7 @@ async def build_ticket_and_notes_transcript_text(
             lines,
             ticket_messages=ticket_messages,
             notes_messages_by_source=notes_messages_by_source,
+            user_lookup=user_lookup,
         )
 
     # Bot/system events are usually duplicate noise, so they are hidden by default.
@@ -1914,9 +2081,10 @@ async def build_ticket_and_notes_transcript_text(
             ticket_events,
             empty_text="No bot/system ticket events were found.",
             compact_embeds=True,
+            user_lookup=user_lookup,
         )
 
-    lines.append("--- END OF TRANSCRIPT ---")
+    lines.append("End of transcript")
     return "\n".join(lines)
 
 
