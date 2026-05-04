@@ -21,6 +21,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "true").strip().lower() not in {"0", "false", "no", "off"}
+TRANSCRIPT_ASCII_SAFE = os.getenv("TRANSCRIPT_ASCII_SAFE", "true").strip().lower() not in {"0", "false", "no", "off"}
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "data/guild_configs.json"))
 DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
@@ -1305,7 +1306,7 @@ def append_transcript_section(lines: list[str], title: str) -> None:
     if lines and lines[-1] != "":
         lines.append("")
     lines.append(transcript_line("="))
-    lines.append(title.upper())
+    lines.append(transcript_safe_text(title).upper())
     lines.append(transcript_line("="))
     lines.append("")
 
@@ -1314,13 +1315,50 @@ def append_transcript_subsection(lines: list[str], title: str) -> None:
     if lines and lines[-1] != "":
         lines.append("")
     lines.append(transcript_line("-", 72))
-    lines.append(title)
+    lines.append(transcript_safe_text(title))
     lines.append(transcript_line("-", 72))
 
 
-def clean_transcript_text(value: Any) -> str:
+def transcript_safe_text(value: Any) -> str:
+    """Make transcript text readable in Discord's text-file preview.
+
+    Discord stores message text as UTF-8, but Discord's attachment preview and
+    some mobile viewers can display smart quotes/emojis as mojibake. This keeps
+    transcripts review-friendly by converting smart punctuation to plain ASCII
+    and, by default, stripping emoji/non-ASCII symbols from the text log.
+    """
     text_value = str(value or "")
+    replacements = {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u201f": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u2026": "...",
+        "\u2022": "-",
+        "\u00a0": " ",
+        "\u200b": "",
+        "\ufe0f": "",
+    }
+    for old, new in replacements.items():
+        text_value = text_value.replace(old, new)
+
+    if TRANSCRIPT_ASCII_SAFE:
+        text_value = text_value.encode("ascii", "ignore").decode("ascii")
+
+    return text_value
+
+
+def clean_transcript_text(value: Any) -> str:
+    text_value = transcript_safe_text(value)
     text_value = text_value.replace("\r\n", "\n").replace("\r", "\n")
+    text_value = re.sub(r"[ \t]+", " ", text_value)
     text_value = re.sub(r"\n{4,}", "\n\n\n", text_value)
     return text_value.strip()
 
@@ -1328,7 +1366,8 @@ def clean_transcript_text(value: Any) -> str:
 def append_indented_text(lines: list[str], value: str, *, indent: str = "    ", empty: str = "[no text]") -> None:
     clean_value = clean_transcript_text(value)
     if not clean_value:
-        lines.append(f"{indent}{empty}")
+        if empty:
+            lines.append(f"{indent}{empty}")
         return
 
     for raw_line in clean_value.split("\n"):
@@ -1339,12 +1378,7 @@ def append_indented_text(lines: list[str], value: str, *, indent: str = "    ", 
 
 
 def get_message_text_for_transcript(message: discord.Message) -> str:
-    """Return the best readable text Discord exposes for this message.
-
-    Regular user message content requires Discord's privileged Message Content
-    Intent. If that intent is disabled in the Developer Portal or disabled in
-    code, Discord returns empty text when we read channel history.
-    """
+    """Return the best readable text Discord exposes for this message."""
     candidates = (
         getattr(message, "clean_content", ""),
         getattr(message, "content", ""),
@@ -1366,43 +1400,58 @@ def message_has_visible_non_text(message: discord.Message) -> bool:
     )
 
 
+def is_transcript_event_message(message: discord.Message) -> bool:
+    """Bot/system messages are useful, but should not clutter the conversation."""
+    if getattr(message.author, "bot", False):
+        return True
+
+    message_type = getattr(message, "type", discord.MessageType.default)
+    return message_type != discord.MessageType.default
+
+
 def format_transcript_author(message: discord.Message) -> str:
     author = message.author
-    display_name = getattr(author, "display_name", None) or getattr(author, "name", None) or str(author)
-    username = str(author)
-    if display_name and username and display_name != username:
-        return f"{display_name} / {username} ({author.id})"
-    return f"{username} ({author.id})"
+    display_name = clean_transcript_text(getattr(author, "display_name", None) or getattr(author, "name", None) or str(author))
+    username = clean_transcript_text(getattr(author, "name", None) or str(author))
+    user_id = getattr(author, "id", 0)
+
+    if username and display_name and username.lower() != display_name.lower():
+        return f"{display_name} (@{username} | {user_id})"
+    if display_name:
+        return f"{display_name} ({user_id})"
+    return f"User {user_id}"
 
 
-def append_embed_transcript(lines: list[str], message: discord.Message) -> None:
+def compact_one_line(value: Any, limit: int = 180) -> str:
+    clean_value = clean_transcript_text(value).replace("\n", " / ")
+    return truncate(clean_value, limit) if clean_value else ""
+
+
+def append_embed_transcript(lines: list[str], message: discord.Message, *, compact: bool = True) -> None:
     if not message.embeds:
         return
 
     for index, embed in enumerate(message.embeds, start=1):
-        title = clean_transcript_text(embed.title)
-        description = clean_transcript_text(embed.description)
-        summary_parts: list[str] = []
-        if title:
-            summary_parts.append(title)
-        if description:
-            summary_parts.append(truncate(description.replace("\n", " "), 220))
-
+        title = compact_one_line(embed.title, 120)
+        description = compact_one_line(embed.description, 180)
+        parts = [part for part in (title, description) if part]
         label = f"Embed {index}"
-        if summary_parts:
-            lines.append(f"    [{label}] " + " — ".join(summary_parts))
+
+        if parts:
+            lines.append(f"    [{label}] " + " - ".join(parts))
         else:
             lines.append(f"    [{label}] Embed with no readable title/description")
 
+        field_limit = 4 if compact else 8
         if embed.fields:
-            for field in embed.fields[:8]:
-                field_name = clean_transcript_text(field.name) or "Unnamed field"
-                field_value = clean_transcript_text(field.value) or "[empty]"
-                lines.append(f"      • {field_name}: {truncate(field_value.replace(chr(10), ' / '), 220)}")
-            if len(embed.fields) > 8:
-                lines.append(f"      • ... {len(embed.fields) - 8} more field(s)")
+            for field in embed.fields[:field_limit]:
+                field_name = compact_one_line(field.name, 80) or "Unnamed field"
+                field_value = compact_one_line(field.value, 180) or "[empty]"
+                lines.append(f"      - {field_name}: {field_value}")
+            if len(embed.fields) > field_limit:
+                lines.append(f"      - ... {len(embed.fields) - field_limit} more field(s)")
 
-        footer_text = clean_transcript_text(getattr(embed.footer, "text", ""))
+        footer_text = compact_one_line(getattr(embed.footer, "text", ""), 160)
         if footer_text:
             lines.append(f"      Footer: {footer_text}")
 
@@ -1418,14 +1467,13 @@ def append_attachment_transcript(lines: list[str], message: discord.Message) -> 
     if not message.attachments:
         return
 
-    lines.append("    Attachments:")
+    lines.append("    Attachments / Evidence:")
     for attachment in message.attachments:
         filename = clean_transcript_text(getattr(attachment, "filename", "")) or "attachment"
         size = getattr(attachment, "size", 0) or 0
         size_text = f"{size:,} bytes" if size else "unknown size"
         lines.append(f"      - {filename} ({size_text})")
         lines.append(f"        {attachment.url}")
-
 
 
 def append_sticker_transcript(lines: list[str], message: discord.Message) -> None:
@@ -1438,57 +1486,68 @@ def append_sticker_transcript(lines: list[str], message: discord.Message) -> Non
         name = clean_transcript_text(getattr(sticker, "name", "")) or "sticker"
         lines.append(f"      - {name}")
 
-async def append_history_lines(lines: list[str], source, *, label: str, include_section: bool = True) -> int:
-    if include_section:
-        append_transcript_section(lines, label)
 
-    count = 0
+async def fetch_history_messages(source) -> list[discord.Message]:
+    messages: list[discord.Message] = []
+    try:
+        async for message in source.history(limit=None, oldest_first=True):
+            messages.append(message)
+    except discord.Forbidden:
+        raise
+    except discord.HTTPException:
+        raise
+    return messages
+
+
+def append_messages_grouped_by_day(
+    lines: list[str],
+    messages: list[discord.Message],
+    *,
+    empty_text: str,
+    compact_embeds: bool = True,
+) -> int:
+    if not messages:
+        lines.append(empty_text)
+        lines.append("")
+        return 0
+
     unreadable_text_count = 0
     current_day = ""
 
-    try:
-        async for message in source.history(limit=None, oldest_first=True):
-            count += 1
-            created = message.created_at.astimezone(timezone.utc)
-            day_label = created.strftime("%A, %B %d, %Y")
-            if day_label != current_day:
-                current_day = day_label
-                append_transcript_subsection(lines, day_label)
+    for message in messages:
+        created = message.created_at.astimezone(timezone.utc)
+        day_label = created.strftime("%A, %B %d, %Y")
+        if day_label != current_day:
+            current_day = day_label
+            append_transcript_subsection(lines, day_label)
 
-            time_label = created.strftime("%H:%M:%S UTC")
-            author = format_transcript_author(message)
-            lines.append(f"[{time_label}] {author}")
+        time_label = created.strftime("%H:%M UTC")
+        author = format_transcript_author(message)
+        lines.append(f"[{time_label}] {author}")
 
-            content = get_message_text_for_transcript(message)
-            if content:
-                append_indented_text(lines, content, empty="")
-            elif message_has_visible_non_text(message):
-                lines.append("    [no written text; see attachments/embeds/stickers below]")
-            else:
-                unreadable_text_count += 1
-                lines.append("    [message text unavailable]")
+        content = get_message_text_for_transcript(message)
+        if content:
+            append_indented_text(lines, content, empty="")
+        elif message_has_visible_non_text(message):
+            lines.append("    [no written text - see attachment/embed/sticker details below]")
+        else:
+            unreadable_text_count += 1
+            lines.append("    [message text unavailable]")
 
-            append_attachment_transcript(lines, message)
-            append_sticker_transcript(lines, message)
-            append_embed_transcript(lines, message)
+        append_attachment_transcript(lines, message)
+        append_sticker_transcript(lines, message)
+        append_embed_transcript(lines, message, compact=compact_embeds)
 
-            if getattr(message, "reactions", None):
-                reaction_parts = []
-                for reaction in message.reactions:
-                    reaction_parts.append(f"{reaction.emoji} x{reaction.count}")
-                if reaction_parts:
-                    lines.append("    Reactions: " + ", ".join(reaction_parts))
+        if getattr(message, "reactions", None):
+            reaction_parts = []
+            for reaction in message.reactions:
+                reaction_parts.append(f"{transcript_safe_text(reaction.emoji)} x{reaction.count}".strip())
+            if reaction_parts:
+                lines.append("    Reactions: " + ", ".join(reaction_parts))
 
-            lines.append("")
-    except discord.Forbidden:
-        lines.append("Unable to read this section from Discord because the bot is missing read permissions.")
-    except discord.HTTPException:
-        lines.append("Unable to read this section from Discord.")
-
-    if count == 0:
-        lines.append("No messages found in this section.")
         lines.append("")
-    elif unreadable_text_count:
+
+    if unreadable_text_count:
         lines.append("NOTE:")
         lines.append(
             f"  {unreadable_text_count} message(s) had no readable text. "
@@ -1498,12 +1557,128 @@ async def append_history_lines(lines: list[str], source, *, label: str, include_
         lines.append("  Messages already closed/transcripted while the intent was disabled cannot have their text recovered by the bot.")
         lines.append("")
 
-    return count
+    return len(messages)
+
+
+async def append_history_lines(lines: list[str], source, *, label: str, include_section: bool = True) -> int:
+    """Compatibility helper for any older code that still asks for raw history."""
+    if include_section:
+        append_transcript_section(lines, label)
+
+    try:
+        messages = await fetch_history_messages(source)
+    except discord.Forbidden:
+        lines.append("Unable to read this section from Discord because the bot is missing read permissions.")
+        return 0
+    except discord.HTTPException:
+        lines.append("Unable to read this section from Discord.")
+        return 0
+
+    return append_messages_grouped_by_day(lines, messages, empty_text="No messages found in this section.")
 
 
 def transcript_file_from_text(text_value: str, filename: str) -> discord.File:
     payload = text_value.encode("utf-8")
     return discord.File(io.BytesIO(payload), filename=filename)
+
+
+def collect_participant_counts(messages: list[discord.Message]) -> dict[int, dict[str, Any]]:
+    participants: dict[int, dict[str, Any]] = {}
+    for message in messages:
+        if is_transcript_event_message(message):
+            continue
+        author = message.author
+        user_id = int(getattr(author, "id", 0) or 0)
+        if not user_id:
+            continue
+        item = participants.setdefault(
+            user_id,
+            {
+                "name": clean_transcript_text(getattr(author, "display_name", None) or getattr(author, "name", None) or str(author)),
+                "username": clean_transcript_text(getattr(author, "name", None) or str(author)),
+                "messages": 0,
+            },
+        )
+        item["messages"] = int(item.get("messages", 0)) + 1
+    return participants
+
+
+def merge_participant_counts(base: dict[int, dict[str, Any]], incoming: dict[int, dict[str, Any]], *, notes: bool = False) -> None:
+    for user_id, item in incoming.items():
+        target = base.setdefault(user_id, {"name": item.get("name", f"User {user_id}"), "username": item.get("username", ""), "messages": 0, "notes": 0})
+        if notes:
+            target["notes"] = int(target.get("notes", 0)) + int(item.get("messages", 0))
+        else:
+            target["messages"] = int(target.get("messages", 0)) + int(item.get("messages", 0))
+
+
+def append_participants_section(
+    lines: list[str],
+    *,
+    owner_id: Optional[int],
+    ticket_messages: list[discord.Message],
+    notes_messages_by_source: list[tuple[discord.abc.GuildChannel, list[discord.Message]]],
+) -> None:
+    combined: dict[int, dict[str, Any]] = {}
+    merge_participant_counts(combined, collect_participant_counts(ticket_messages), notes=False)
+    for _, note_messages in notes_messages_by_source:
+        merge_participant_counts(combined, collect_participant_counts(note_messages), notes=True)
+
+    append_transcript_section(lines, "Participants")
+    if not combined:
+        lines.append("No non-bot participants were found.")
+        lines.append("")
+        return
+
+    lines.append("Role        Messages  Notes  User")
+    lines.append("----------  --------  -----  ----------------------------------------")
+    for user_id, item in sorted(combined.items(), key=lambda entry: (0 if entry[0] == owner_id else 1, str(entry[1].get("name", "")).lower())):
+        role = "Owner" if user_id == owner_id else "Staff/User"
+        msg_count = int(item.get("messages", 0))
+        note_count = int(item.get("notes", 0))
+        name = clean_transcript_text(item.get("name", f"User {user_id}")) or f"User {user_id}"
+        username = clean_transcript_text(item.get("username", ""))
+        user_text = f"{name}"
+        if username and username.lower() != name.lower():
+            user_text += f" (@{username})"
+        user_text += f" - {user_id}"
+        lines.append(f"{role:<10}  {msg_count:<8}  {note_count:<5}  {user_text}")
+    lines.append("")
+
+
+def append_attachment_index(
+    lines: list[str],
+    *,
+    ticket_messages: list[discord.Message],
+    notes_messages_by_source: list[tuple[discord.abc.GuildChannel, list[discord.Message]]],
+) -> None:
+    items: list[tuple[str, discord.Message, Any]] = []
+    for message in ticket_messages:
+        for attachment in getattr(message, "attachments", []) or []:
+            items.append(("Ticket Conversation", message, attachment))
+
+    for notes_source, note_messages in notes_messages_by_source:
+        source_label = f"Staff Notes: #{getattr(notes_source, 'name', 'notes')}"
+        for message in note_messages:
+            for attachment in getattr(message, "attachments", []) or []:
+                items.append((source_label, message, attachment))
+
+    append_transcript_section(lines, "Evidence / Attachments")
+    if not items:
+        lines.append("No attachments were posted in this ticket.")
+        lines.append("")
+        return
+
+    for index, (source_label, message, attachment) in enumerate(items, start=1):
+        created = message.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        filename = clean_transcript_text(getattr(attachment, "filename", "")) or "attachment"
+        size = getattr(attachment, "size", 0) or 0
+        size_text = f"{size:,} bytes" if size else "unknown size"
+        lines.append(f"{index}. {filename} ({size_text})")
+        lines.append(f"   Posted: {created} by {format_transcript_author(message)}")
+        lines.append(f"   Source: {source_label}")
+        lines.append(f"   Link  : {attachment.url}")
+    lines.append("")
 
 
 async def build_ticket_and_notes_transcript_text(
@@ -1519,28 +1694,6 @@ async def build_ticket_and_notes_transcript_text(
     claimed_by = get_claimed_by_id(channel)
     generated_at = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    lines.append(transcript_line("="))
-    lines.append(f"STARZ TICKET #{ticket_number} TRANSCRIPT")
-    lines.append(transcript_line("="))
-    lines.append(f"Type       : {ticket_kind}")
-    lines.append(f"Channel    : #{channel.name} ({channel.id})")
-    lines.append(f"Owner      : {format_user_reference(channel.guild, owner_id)}")
-    lines.append(f"Claimed By : {format_user_reference(channel.guild, claimed_by)}")
-    lines.append(f"Generated  : {generated_at}")
-    lines.append(transcript_line("="))
-    lines.append("")
-    lines.append("READING NOTES:")
-    lines.append("- Conversation is grouped by day and then ordered oldest to newest.")
-    lines.append("- User/staff messages appear as timestamp, display name, Discord username, and Discord ID.")
-    lines.append("- If a line says [message text unavailable], Discord did not expose that message text to the bot.")
-    lines.append("")
-
-    if audit_text:
-        append_transcript_section(lines, "Ticket Summary")
-        append_indented_text(lines, audit_text, indent="  ", empty="No audit data available.")
-
-    await append_history_lines(lines, channel, label="Ticket Conversation")
-
     notes_sources: list[discord.abc.GuildChannel] = []
     if notes_thread is not None:
         notes_sources.append(notes_thread)
@@ -1549,17 +1702,111 @@ async def build_ticket_and_notes_transcript_text(
             if notes_channel is not None and notes_channel not in notes_sources:
                 notes_sources.append(notes_channel)
 
-    append_transcript_section(lines, "Staff Notes")
-    if notes_sources:
-        lines.append("Internal staff notes linked to this exact ticket.")
-        lines.append("")
-        for notes_source in notes_sources:
-            source_type = "Private Thread" if isinstance(notes_source, discord.Thread) else "Legacy Notes Channel"
-            append_transcript_subsection(lines, f"{source_type}: #{notes_source.name} ({notes_source.id})")
-            await append_history_lines(lines, notes_source, label=f"Staff Notes - {source_type}", include_section=False)
+    try:
+        ticket_messages = await fetch_history_messages(channel)
+    except discord.Forbidden:
+        ticket_messages = []
+        ticket_read_error = "Unable to read the ticket conversation because the bot is missing read permissions."
+    except discord.HTTPException:
+        ticket_messages = []
+        ticket_read_error = "Unable to read the ticket conversation from Discord."
     else:
+        ticket_read_error = ""
+
+    notes_messages_by_source: list[tuple[discord.abc.GuildChannel, list[discord.Message]]] = []
+    notes_read_errors: list[str] = []
+    for notes_source in notes_sources:
+        try:
+            note_messages = await fetch_history_messages(notes_source)
+        except discord.Forbidden:
+            note_messages = []
+            notes_read_errors.append(f"Unable to read staff notes from #{getattr(notes_source, 'name', 'notes')} because the bot is missing read permissions.")
+        except discord.HTTPException:
+            note_messages = []
+            notes_read_errors.append(f"Unable to read staff notes from #{getattr(notes_source, 'name', 'notes')} from Discord.")
+        notes_messages_by_source.append((notes_source, note_messages))
+
+    ticket_events = [message for message in ticket_messages if is_transcript_event_message(message)]
+    ticket_conversation = [message for message in ticket_messages if not is_transcript_event_message(message)]
+
+    lines.append(transcript_line("="))
+    lines.append(f"STARZ TICKET #{ticket_number} TRANSCRIPT")
+    lines.append(transcript_line("="))
+    lines.append(f"Type       : {ticket_kind}")
+    lines.append(f"Channel    : #{clean_transcript_text(channel.name)} ({channel.id})")
+    lines.append(f"Owner      : {format_user_reference(channel.guild, owner_id)}")
+    lines.append(f"Claimed By : {format_user_reference(channel.guild, claimed_by)}")
+    lines.append(f"Generated  : {generated_at}")
+    lines.append(transcript_line("="))
+    lines.append("")
+    lines.append("READING NOTES")
+    lines.append("- Bot/system messages are separated into TICKET EVENTS so the conversation is easier to follow.")
+    lines.append("- Staff notes are separated from the public ticket conversation.")
+    lines.append("- Attachments are shown inline and also indexed in EVIDENCE / ATTACHMENTS.")
+    lines.append("- Text is saved in an ASCII-safe format by default to avoid Discord preview mojibake.")
+    lines.append("")
+
+    if audit_text:
+        append_transcript_section(lines, "Ticket Summary")
+        append_indented_text(lines, audit_text, indent="  ", empty="No audit data available.")
+
+    append_participants_section(
+        lines,
+        owner_id=owner_id,
+        ticket_messages=ticket_messages,
+        notes_messages_by_source=notes_messages_by_source,
+    )
+
+    append_transcript_section(lines, "Ticket Events")
+    if ticket_read_error:
+        lines.append(ticket_read_error)
+        lines.append("")
+    else:
+        append_messages_grouped_by_day(
+            lines,
+            ticket_events,
+            empty_text="No bot/system ticket events were found.",
+            compact_embeds=True,
+        )
+
+    append_transcript_section(lines, "Ticket Conversation")
+    if ticket_read_error:
+        lines.append(ticket_read_error)
+        lines.append("")
+    else:
+        append_messages_grouped_by_day(
+            lines,
+            ticket_conversation,
+            empty_text="No user/staff conversation messages were found.",
+            compact_embeds=True,
+        )
+
+    append_attachment_index(
+        lines,
+        ticket_messages=ticket_messages,
+        notes_messages_by_source=notes_messages_by_source,
+    )
+
+    append_transcript_section(lines, "Staff Notes")
+    if not notes_sources:
         lines.append("No staff notes thread was linked to this ticket.")
         lines.append("")
+    else:
+        for error in notes_read_errors:
+            lines.append(error)
+        if notes_read_errors:
+            lines.append("")
+
+        for notes_source, note_messages in notes_messages_by_source:
+            source_type = "Private Thread" if isinstance(notes_source, discord.Thread) else "Legacy Notes Channel"
+            append_transcript_subsection(lines, f"{source_type}: #{clean_transcript_text(getattr(notes_source, 'name', 'notes'))} ({notes_source.id})")
+            staff_note_messages = [message for message in note_messages if not is_transcript_event_message(message)]
+            append_messages_grouped_by_day(
+                lines,
+                staff_note_messages,
+                empty_text="No written staff notes were posted in this notes source.",
+                compact_embeds=True,
+            )
 
     append_transcript_section(lines, "End Of Transcript")
     lines.append(f"Generated by STARZ ticket bot at {generated_at}.")
