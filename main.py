@@ -599,7 +599,30 @@ def get_ticket_ping_role_ids(channel: discord.TextChannel) -> list[int]:
 
 
 def is_ticket_channel(channel: discord.abc.GuildChannel) -> bool:
-    return isinstance(channel, discord.TextChannel) and "ticket_owner:" in (channel.topic or "")
+    """Return True for both old raw ticket topics and new readable ticket headers.
+
+    Older tickets used machine metadata in the channel topic:
+    `ticket_owner:...|ticket_type:...|ticket_number:...`
+
+    Newer tickets use a staff-friendly Discord header:
+    `Creator: @user (id) | Ticket #123 | Type: Normal | ...`
+
+    Button callbacks and `/sclose` rely on this helper, so it must not check
+    only for the old literal `ticket_owner:` text.
+    """
+    if not isinstance(channel, discord.TextChannel):
+        return False
+
+    topic = channel.topic or ""
+    data = parse_ticket_topic(topic)
+
+    owner_id = data.get("ticket_owner", "")
+    ticket_number = data.get("ticket_number", "")
+    if owner_id.isdigit() and (ticket_number.isdigit() or re.search(r"\bticket[-_]?\d+\b", channel.name, re.IGNORECASE)):
+        return True
+
+    # Safety fallback for readable headers if Discord changes mention rendering.
+    return bool(re.search(r"\bCreator\s*:", topic, re.IGNORECASE) and re.search(r"\bTicket\s*#\s*\d+", topic, re.IGNORECASE))
 
 
 def get_ticket_owner_id(channel: discord.TextChannel) -> Optional[int]:
