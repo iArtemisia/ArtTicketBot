@@ -482,29 +482,108 @@ def build_ticket_topic(
     ping_role_ids: Optional[list[int]] = None,
     ticket_number: str = "",
 ) -> str:
-    ping_part = ",".join(str(role_id) for role_id in (ping_role_ids or []))
-    clean_ticket_number = re.sub(r"[^0-9]", "", str(ticket_number or ""))
-    clean_ticket_type = ticket_type or "normal"
+    """Build the public ticket channel topic/header.
+
+    Discord shows this text in the ticket header/welcome screen. Older builds
+    exposed raw machine metadata such as `ticket_owner:...|ticket_type:...`,
+    which was ugly and hard for staff to use. This keeps the topic readable
+    while `parse_ticket_topic` still understands it for bot logic.
+    """
+    clean_ticket_number = re.sub(r"[^0-9]", "", str(ticket_number or "")) or "unknown"
+    clean_ticket_type = "priority" if str(ticket_type or "normal").lower().strip() == "priority" else "normal"
+    clean_status = str(status or "open").lower().strip() or "open"
+
+    try:
+        clean_owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        clean_owner_id = 0
+
+    try:
+        clean_claimed_by = int(claimed_by or 0)
+    except (TypeError, ValueError):
+        clean_claimed_by = 0
+
+    creator_part = f"<@{clean_owner_id}> ({clean_owner_id})" if clean_owner_id else "Unknown creator"
+    claimed_part = f"<@{clean_claimed_by}> ({clean_claimed_by})" if clean_claimed_by else "None"
+
+    clean_ping_ids: list[int] = []
+    for raw_role_id in ping_role_ids or []:
+        try:
+            role_id = int(raw_role_id)
+        except (TypeError, ValueError):
+            continue
+        if role_id and role_id not in clean_ping_ids:
+            clean_ping_ids.append(role_id)
+
+    ping_part = ", ".join(f"<@&{role_id}>" for role_id in clean_ping_ids) if clean_ping_ids else "None"
+
     return (
-        f"ticket_owner:{owner_id}|"
-        f"ticket_type:{clean_ticket_type}|"
-        f"ticket_number:{clean_ticket_number}|"
-        f"status:{status}|"
-        f"claimed_by:{claimed_by}|"
-        f"ping_roles:{ping_part}"
+        f"Creator: {creator_part} | "
+        f"Ticket #{clean_ticket_number} | "
+        f"Type: {clean_ticket_type.title()} | "
+        f"Status: {clean_status.title()} | "
+        f"Claimed: {claimed_part} | "
+        f"Ping Roles: {ping_part}"
     )
 
 
 def parse_ticket_topic(topic: Optional[str]) -> dict[str, str]:
+    """Parse both old raw metadata topics and new readable ticket headers."""
     data: dict[str, str] = {}
     if not topic:
         return data
 
-    for part in topic.split("|"):
+    raw_topic = str(topic)
+
+    for part in raw_topic.split("|"):
         if ":" not in part:
             continue
         key, value = part.split(":", 1)
-        data[key] = value
+        raw_key = key.strip()
+        clean_key = raw_key.lower().strip().replace(" ", "_")
+        clean_value = value.strip()
+
+        # Old metadata format: ticket_owner:123|ticket_type:normal|...
+        if clean_key in {"ticket_owner", "ticket_type", "ticket_number", "status", "claimed_by", "ping_roles"}:
+            data[clean_key] = clean_value
+            continue
+
+        # New readable header format shown in Discord's ticket header.
+        if clean_key in {"creator", "created_by", "owner", "ticket_owner"}:
+            user_id = extract_id(clean_value)
+            if user_id is not None:
+                data["ticket_owner"] = str(user_id)
+        elif clean_key in {"type", "ticket_type"}:
+            value_lower = clean_value.lower().strip()
+            data["ticket_type"] = "priority" if value_lower == "priority" else "normal"
+        elif clean_key == "status":
+            data["status"] = clean_value.lower().strip() or "open"
+        elif clean_key in {"claimed", "claimed_by"}:
+            user_id = extract_id(clean_value)
+            data["claimed_by"] = str(user_id) if user_id is not None else "0"
+        elif clean_key in {"ping_roles", "ping_role_ids"}:
+            data["ping_roles"] = ",".join(str(role_id) for role_id in extract_ids(clean_value))
+
+    # New readable header uses `Ticket #123`, which has no colon.
+    if not data.get("ticket_number"):
+        ticket_match = re.search(r"\bTicket\s*#\s*(\d+)\b", raw_topic, re.IGNORECASE)
+        if ticket_match:
+            data["ticket_number"] = ticket_match.group(1)
+
+    # Normalize old metadata values too.
+    if data.get("ticket_type"):
+        data["ticket_type"] = "priority" if data["ticket_type"].lower().strip() == "priority" else "normal"
+    if data.get("status"):
+        data["status"] = data["status"].lower().strip() or "open"
+    if data.get("claimed_by"):
+        claimed_id = extract_id(data["claimed_by"]) or (int(data["claimed_by"]) if str(data["claimed_by"]).strip().isdigit() else 0)
+        data["claimed_by"] = str(claimed_id)
+    if data.get("ping_roles"):
+        ping_ids = extract_ids(data["ping_roles"])
+        if not ping_ids:
+            ping_ids = [int(value) for value in re.findall(r"\d{15,25}", data["ping_roles"])]
+        data["ping_roles"] = ",".join(str(role_id) for role_id in ping_ids)
+
     return data
 
 
@@ -580,6 +659,19 @@ def format_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
     if member is not None:
         return f"{member.mention} (`{member.id}`)"
     return f"<@{user_id}> (`{user_id}`)"
+
+
+def format_log_user_reference(user_id: Optional[int]) -> str:
+    """Format users for the transcript log embed using a Discord mention plus ID.
+
+    This is only used in the Discord log embed, not inside downloaded
+    transcripts. Embeds should show the clickable @ mention and the raw ID so
+    staff can quickly open/copy the user.
+    """
+    if not user_id:
+        return "None"
+    clean_id = int(user_id)
+    return f"<@{clean_id}> (`{clean_id}`)"
 
 
 def ticket_status_color(ticket_type: str, *, status: str = "open", claimed_by: Optional[int] = None) -> discord.Color:
@@ -1687,7 +1779,7 @@ def format_transcript_user_reference(
         if entry:
             return entry["header"]
 
-    return f"User {clean_id} - {clean_id}"
+    return f"Discord User - {clean_id}"
 
 
 def format_transcript_user_value(
@@ -1721,7 +1813,7 @@ def format_transcript_author(
     if entry:
         return entry["line"]
 
-    return f"User {user_id}" if user_id else "Unknown User"
+    return f"Discord User ({user_id})" if user_id else "Unknown User"
 
 def compact_one_line(value: Any, limit: int = 180) -> str:
     clean_value = clean_transcript_text(value).replace("\n", " / ")
@@ -2523,10 +2615,18 @@ def format_notes_sources_for_embed(
     legacy_notes_channels: Optional[list[discord.TextChannel]] = None,
 ) -> str:
     sources: list[str] = []
+
+    def source_label(source: discord.abc.GuildChannel, fallback: str = "notes") -> str:
+        name = clean_transcript_text(getattr(source, "name", "") or fallback)
+        source_id = int(getattr(source, "id", 0) or 0)
+        if source_id:
+            return f"#{name} (`{source_id}`)"
+        return f"#{name}"
+
     if notes_thread is not None:
-        sources.append(notes_thread.mention)
+        sources.append(source_label(notes_thread, "notes-thread"))
     for notes_channel in legacy_notes_channels or []:
-        sources.append(notes_channel.mention)
+        sources.append(source_label(notes_channel, "notes-channel"))
 
     if not sources:
         return "No staff notes were linked."
@@ -3097,6 +3197,17 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             )
             return
 
+        closing_ticket_ids = getattr(self.bot, "closing_ticket_ids", set())
+        if self.channel.id in closing_ticket_ids:
+            await interaction.response.send_message(
+                "This ticket is already closing. Please wait for the current close/transcript task to finish.",
+                ephemeral=True,
+            )
+            return
+
+        closing_ticket_ids.add(self.channel.id)
+        self.bot.closing_ticket_ids = closing_ticket_ids
+
         reason_text = str(self.reason.value).strip() or "No reason provided."
         await interaction.response.send_message("Closing the ticket and saving transcript...", ephemeral=True)
 
@@ -3106,136 +3217,239 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         ticket_number = get_ticket_number(self.channel)
         ticket_kind = get_ticket_kind(self.channel)
 
-        try:
-            await update_ticket_metadata(
-                self.channel,
-                status="closed",
-                claimed_by=claimed_by,
-                ping_role_ids=ping_role_ids,
-                ticket_number=ticket_number,
-                ticket_type=ticket_kind,
-            )
-        except discord.HTTPException:
-            pass
-
-        self.bot.stats_store.ensure_ticket_from_channel(self.channel)
-        self.bot.stats_store.record_close(interaction.guild.id, self.channel.id, interaction.user.id, reason_text)
-        notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
-        legacy_notes_channels = find_legacy_notes_channels_for_ticket(interaction.guild, self.channel)
-        audit_text = build_ticket_audit_text(self.bot, interaction.guild, self.channel)
-        transcript_text = await build_ticket_and_notes_transcript_text(
-            self.channel,
-            notes_thread,
-            audit_text=audit_text,
-            extra_notes_channels=legacy_notes_channels,
-        )
-        try:
-            save_ticket_log_text(interaction.guild.id, ticket_log_id, transcript_text)
-        except OSError:
-            pass
-
-        ticket_stats = self.bot.stats_store.get_ticket(interaction.guild.id, self.channel.id)
-        log_channel = await get_log_channel(self.bot, interaction.guild)
-        closed_at = now_utc()
-        embed = discord.Embed(title=f"Ticket #{ticket_number} Closed", color=discord.Color.red(), timestamp=closed_at)
-        embed.description = (
-            f"**Type:** {ticket_kind.title()}\n"
-            f"**Channel ID:** `{ticket_log_id}`\n"
-            f"**Reason:** {truncate(reason_text, 900)}"
-        )
-        embed.add_field(
-            name="People",
-            value=(
-                f"**Opened by:** {format_transcript_user_reference(interaction.guild, owner_id)}\n"
-                f"**Claimed by:** {format_transcript_user_reference(interaction.guild, claimed_by if claimed_by else None)}\n"
-                f"**Closed by:** {format_transcript_user_reference(interaction.guild, interaction.user.id)}"
-            ),
-            inline=False,
-        )
-        if notes_thread is not None or legacy_notes_channels:
-            embed.add_field(
-                name="Staff Notes",
-                value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
-                inline=False,
-            )
-        footer_text = "Open the .html attachment for the colored transcript."
-        if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED:
-            footer_text += " Plain .txt fallback is also attached."
-        embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • {footer_text}")
-
-        log_sent = False
-        log_error = ""
-        if log_channel is None:
-            log_error = "No closed-ticket log channel is configured or the configured channel no longer exists."
-        else:
+        async def safe_followup(message: str) -> None:
             try:
-                safe_base_name = f"ticket-{ticket_number}-{ticket_log_id}-{self.channel.name}-transcript"
-                transcript_files: list[discord.File] = []
+                await interaction.followup.send(message, ephemeral=True)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
-                if TRANSCRIPT_HTML_ENABLED:
+        async def reopen_ticket_metadata() -> None:
+            try:
+                await update_ticket_metadata(
+                    self.channel,
+                    status="open",
+                    claimed_by=claimed_by,
+                    ping_role_ids=ping_role_ids,
+                    ticket_number=ticket_number,
+                    ticket_type=ticket_kind,
+                )
+            except discord.HTTPException:
+                pass
+
+        def safe_filename_part(value: Any, limit: int = 80) -> str:
+            cleaned = clean_transcript_text(value).lower()
+            cleaned = re.sub(r"[^a-z0-9_.-]+", "-", cleaned)
+            cleaned = re.sub(r"-+", "-", cleaned).strip("-._")
+            return (cleaned or "ticket")[:limit]
+
+        async def send_transcript_log_message(
+            log_channel: discord.TextChannel,
+            embed: discord.Embed,
+            transcript_text: str,
+        ) -> tuple[bool, str]:
+            safe_base_name = (
+                f"ticket-{safe_filename_part(ticket_number, 16)}-"
+                f"{safe_filename_part(ticket_log_id, 24)}-"
+                f"{safe_filename_part(self.channel.name, 48)}-transcript"
+            )[:140]
+
+            # Try the colored HTML transcript first. If Discord rejects it because
+            # of size/type/network problems, retry with the plain-text transcript
+            # so closing is not blocked by the optional colored copy.
+            if TRANSCRIPT_HTML_ENABLED:
+                try:
                     transcript_html = build_colored_transcript_html(
                         transcript_text,
                         page_title=f"STARZ Ticket #{ticket_number} Transcript",
                     )
-                    transcript_files.append(transcript_file_from_html(transcript_html, f"colored-{safe_base_name}.html"))
+                    files = [transcript_file_from_html(transcript_html, f"colored-{safe_base_name}.html")]
+                    if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED:
+                        files.append(transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"))
+                    await asyncio.wait_for(log_channel.send(embed=embed, files=files), timeout=30)
+                    return True, ""
+                except discord.Forbidden:
+                    return False, f"I do not have permission to send embeds/files in {log_channel.mention}."
+                except (discord.HTTPException, asyncio.TimeoutError, ValueError, OSError) as exc:
+                    html_error = truncate(str(exc), 350)
 
-                if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED or not transcript_files:
-                    transcript_files.append(transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"))
+                    try:
+                        fallback_embed = embed.copy()
+                        fallback_embed.set_footer(text="Colored HTML transcript failed to upload, so a plain .txt transcript was attached instead.")
+                        await asyncio.wait_for(
+                            log_channel.send(
+                                embed=fallback_embed,
+                                file=transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"),
+                            ),
+                            timeout=30,
+                        )
+                        return True, ""
+                    except discord.Forbidden:
+                        return False, f"I do not have permission to send embeds/files in {log_channel.mention}."
+                    except (discord.HTTPException, asyncio.TimeoutError, ValueError, OSError) as fallback_exc:
+                        return False, (
+                            "Discord rejected both transcript uploads. "
+                            f"HTML error: `{html_error}` | TXT error: `{truncate(str(fallback_exc), 350)}`"
+                        )
 
-                await log_channel.send(embed=embed, files=transcript_files)
-                log_sent = True
-            except discord.Forbidden:
-                log_error = f"I do not have permission to send embeds/files in {log_channel.mention}."
-            except discord.HTTPException as exc:
-                log_error = f"Discord rejected the ticket log message: `{truncate(str(exc), 500)}`"
-
-        if not log_sent:
-            await interaction.followup.send(
-                "I could not send the transcript to the configured ticket log channel, so I am keeping this ticket open to prevent transcript loss.\n\n"
-                f"Reason: {log_error}\n\n"
-                "Fix the log channel permissions, then press **Close** again.",
-                ephemeral=True,
-            )
             try:
-                await self.channel.send(
-                    f"⚠️ Ticket close was stopped because the transcript could not be posted to the log channel.\nReason: {log_error}"
+                await asyncio.wait_for(
+                    log_channel.send(
+                        embed=embed,
+                        file=transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"),
+                    ),
+                    timeout=30,
+                )
+                return True, ""
+            except discord.Forbidden:
+                return False, f"I do not have permission to send embeds/files in {log_channel.mention}."
+            except (discord.HTTPException, asyncio.TimeoutError, ValueError, OSError) as exc:
+                return False, f"Discord rejected the ticket log message: `{truncate(str(exc), 500)}`"
+
+        try:
+            try:
+                await update_ticket_metadata(
+                    self.channel,
+                    status="closed",
+                    claimed_by=claimed_by,
+                    ping_role_ids=ping_role_ids,
+                    ticket_number=ticket_number,
+                    ticket_type=ticket_kind,
                 )
             except discord.HTTPException:
                 pass
-            return
 
-        try:
-            close_notice = build_ticket_event_embed(
-                title="🔒 Ticket Closed",
-                description=f"Closed by {interaction.user.mention}.\n\n**Reason:** {truncate(reason_text, 900)}",
-                color=ticket_status_color(ticket_kind, status="closed"),
-            )
-            await self.channel.send(embed=close_notice)
-        except discord.HTTPException:
-            pass
+            self.bot.stats_store.ensure_ticket_from_channel(self.channel)
+            self.bot.stats_store.record_close(interaction.guild.id, self.channel.id, interaction.user.id, reason_text)
+            notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
+            legacy_notes_channels = find_legacy_notes_channels_for_ticket(interaction.guild, self.channel)
+            audit_text = build_ticket_audit_text(self.bot, interaction.guild, self.channel)
 
-        for legacy_notes_channel in legacy_notes_channels:
             try:
-                await legacy_notes_channel.delete(reason=f"Ticket {self.channel.id} closed; legacy staff notes transcript saved.")
+                transcript_text = await asyncio.wait_for(
+                    build_ticket_and_notes_transcript_text(
+                        self.channel,
+                        notes_thread,
+                        audit_text=audit_text,
+                        extra_notes_channels=legacy_notes_channels,
+                    ),
+                    timeout=90,
+                )
+            except asyncio.TimeoutError:
+                await reopen_ticket_metadata()
+                await safe_followup(
+                    "Ticket close stopped because transcript generation took too long. Try again in a moment, or check that the bot can read this ticket and its notes thread."
+                )
+                return
+            except Exception as exc:
+                await reopen_ticket_metadata()
+                await safe_followup(
+                    f"Ticket close stopped because transcript generation failed: `{truncate(str(exc), 500)}`"
+                )
+                return
+
+            try:
+                save_ticket_log_text(interaction.guild.id, ticket_log_id, transcript_text)
+            except OSError:
+                pass
+
+            log_channel = await get_log_channel(self.bot, interaction.guild)
+            closed_at = now_utc()
+            embed = discord.Embed(title=f"Ticket #{ticket_number} Closed", color=discord.Color.red(), timestamp=closed_at)
+            embed.description = (
+                f"**Type:** {ticket_kind.title()}\n"
+                f"**Channel ID:** `{ticket_log_id}`\n"
+                f"**Reason:** {truncate(reason_text, 900)}"
+            )
+            embed.add_field(
+                name="People",
+                value=(
+                    f"**Opened by:** {format_log_user_reference(owner_id)}\n"
+                    f"**Claimed by:** {format_log_user_reference(claimed_by if claimed_by else None)}\n"
+                    f"**Closed by:** {format_log_user_reference(interaction.user.id)}"
+                ),
+                inline=False,
+            )
+            if notes_thread is not None or legacy_notes_channels:
+                embed.add_field(
+                    name="Staff Notes",
+                    value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
+                    inline=False,
+                )
+            footer_text = "Open the .html attachment for the colored transcript."
+            if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED:
+                footer_text += " Plain .txt fallback is also attached."
+            else:
+                footer_text += " If HTML upload fails, a plain .txt transcript is attached automatically."
+            embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • {footer_text}")
+
+            log_sent = False
+            log_error = ""
+            if log_channel is None:
+                log_error = "No closed-ticket log channel is configured or the configured channel no longer exists."
+            else:
+                log_sent, log_error = await send_transcript_log_message(log_channel, embed, transcript_text)
+
+            if not log_sent:
+                await reopen_ticket_metadata()
+                await safe_followup(
+                    "I could not send the transcript to the configured ticket log channel, so I am keeping this ticket open to prevent transcript loss.\n\n"
+                    f"Reason: {log_error}\n\n"
+                    "Fix the log channel permissions, then run `/sclose` again."
+                )
+                try:
+                    await self.channel.send(
+                        f"⚠️ Ticket close was stopped because the transcript could not be posted to the log channel.\nReason: {log_error}"
+                    )
+                except discord.HTTPException:
+                    pass
+                return
+
+            try:
+                close_notice = build_ticket_event_embed(
+                    title="🔒 Ticket Closed",
+                    description=f"Closed by {interaction.user.mention}.\n\n**Reason:** {truncate(reason_text, 900)}",
+                    color=ticket_status_color(ticket_kind, status="closed"),
+                )
+                await self.channel.send(embed=close_notice)
             except discord.HTTPException:
                 pass
 
-        if notes_thread is not None:
-            clear_notes_thread_id(self.bot, interaction.guild.id, self.channel.id)
+            for legacy_notes_channel in legacy_notes_channels:
+                try:
+                    await legacy_notes_channel.delete(reason=f"Ticket {self.channel.id} closed; legacy staff notes transcript saved.")
+                except discord.HTTPException:
+                    pass
 
-        await asyncio.sleep(4)
-        try:
-            await self.channel.delete(reason=f"Ticket closed by {interaction.user} ({interaction.user.id})")
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "The transcript was posted, but I could not delete the ticket channel. Give me **Manage Channels** in the ticket category.",
-                ephemeral=True,
+            if notes_thread is not None:
+                clear_notes_thread_id(self.bot, interaction.guild.id, self.channel.id)
+
+            await safe_followup("Transcript saved. Deleting this ticket channel now.")
+            await asyncio.sleep(4)
+            try:
+                await self.channel.delete(reason=f"Ticket closed by {interaction.user} ({interaction.user.id})")
+            except discord.Forbidden:
+                await safe_followup(
+                    "The transcript was posted, but I could not delete the ticket channel. Give me **Manage Channels** in the ticket category."
+                )
+            except discord.HTTPException as exc:
+                await safe_followup(
+                    f"The transcript was posted, but Discord rejected the channel delete: `{truncate(str(exc), 500)}`"
+                )
+        except Exception as exc:
+            await reopen_ticket_metadata()
+            await safe_followup(
+                f"Ticket close failed before it could finish. The ticket was left open. Error: `{truncate(str(exc), 500)}`"
             )
-        except discord.HTTPException as exc:
-            await interaction.followup.send(
-                f"The transcript was posted, but Discord rejected the channel delete: `{truncate(str(exc), 500)}`",
-                ephemeral=True,
-            )
+            try:
+                await self.channel.send(
+                    f"⚠️ Ticket close failed and the ticket was left open. Error: `{truncate(str(exc), 500)}`"
+                )
+            except discord.HTTPException:
+                pass
+        finally:
+            closing_ticket_ids = getattr(self.bot, "closing_ticket_ids", set())
+            closing_ticket_ids.discard(self.channel.id)
+            self.bot.closing_ticket_ids = closing_ticket_ids
 
 
 class TicketOpenButton(discord.ui.Button):
@@ -4478,6 +4692,7 @@ class TicketBot(commands.Bot):
         self.config_store = GuildConfigStore(CONFIG_PATH)
         self.stats_store = TicketStatsStore(TICKET_STATS_PATH)
         self.ticket_ping_cooldowns: dict[int, datetime] = {}
+        self.closing_ticket_ids: set[int] = set()
 
     async def setup_hook(self) -> None:
         self.add_view(TicketPanelView(self))
