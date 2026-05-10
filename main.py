@@ -481,6 +481,8 @@ def build_ticket_topic(
     claimed_by: int = 0,
     ping_role_ids: Optional[list[int]] = None,
     ticket_number: str = "",
+    owner_label: str = "",
+    claimed_label: str = "",
 ) -> str:
     """Build the public ticket channel topic/header.
 
@@ -503,8 +505,8 @@ def build_ticket_topic(
     except (TypeError, ValueError):
         clean_claimed_by = 0
 
-    creator_part = f"<@{clean_owner_id}> ({clean_owner_id})" if clean_owner_id else "Unknown creator"
-    claimed_part = f"<@{clean_claimed_by}> ({clean_claimed_by})" if clean_claimed_by else "None"
+    creator_part = owner_label.strip() if owner_label.strip() else (f"<@{clean_owner_id}> (Discord ID {clean_owner_id})" if clean_owner_id else "Unknown creator")
+    claimed_part = claimed_label.strip() if claimed_label.strip() else (f"<@{clean_claimed_by}> (Discord ID {clean_claimed_by})" if clean_claimed_by else "None")
 
     clean_ping_ids: list[int] = []
     for raw_role_id in ping_role_ids or []:
@@ -675,13 +677,78 @@ def notes_channel_name(ticket_channel: discord.TextChannel) -> str:
     return f"notes-{ticket_number}"[:95]
 
 
+def discord_member_display_name(member: discord.abc.User) -> str:
+    """Return the best readable Discord display name available for embeds/logs."""
+    display_name = (
+        getattr(member, "display_name", None)
+        or getattr(member, "global_name", None)
+        or getattr(member, "name", None)
+        or str(member)
+    )
+    return str(display_name or "Discord User").strip() or "Discord User"
+
+
+def discord_member_username(member: discord.abc.User) -> str:
+    """Return the Discord username/handle when Discord exposes it."""
+    username = getattr(member, "name", None) or str(member)
+    return str(username or "").strip()
+
+
+def format_member_reference(member: discord.abc.User) -> str:
+    """Format a resolved Discord member/user with mention, name, username, and ID."""
+    user_id = int(getattr(member, "id", 0) or 0)
+    display_name = discord_member_display_name(member)
+    username = discord_member_username(member)
+    name_line = display_name
+    if username and username.lower() != display_name.lower():
+        name_line = f"{display_name} (@{username})"
+    mention = getattr(member, "mention", f"<@{user_id}>")
+    return f"{mention}\n{name_line}\n`{user_id}`"
+
+
+def format_member_topic_reference(member: discord.abc.User) -> str:
+    """Short readable creator/claimer text for the Discord channel header/topic."""
+    user_id = int(getattr(member, "id", 0) or 0)
+    display_name = discord_member_display_name(member)
+    username = discord_member_username(member)
+    label = display_name
+    if username and username.lower() != display_name.lower():
+        label = f"{display_name} / @{username}"
+    mention = getattr(member, "mention", f"<@{user_id}>")
+    return f"{mention} ({label} | {user_id})"
+
+
 def format_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
+    """Sync best-effort user label for embeds. Prefer resolved names over raw IDs."""
     if not user_id:
         return "None"
-    member = guild.get_member(user_id)
+    member = guild.get_member(int(user_id))
     if member is not None:
-        return f"{member.mention} (`{member.id}`)"
-    return f"<@{user_id}> (`{user_id}`)"
+        return format_member_reference(member)
+    clean_id = int(user_id)
+    return f"<@{clean_id}>\nDiscord ID: `{clean_id}`"
+
+
+async def format_user_reference_async(guild: discord.Guild, user_id: Optional[int]) -> str:
+    """Async user label that fetches the member when it is not in cache."""
+    if not user_id:
+        return "None"
+    member = await fetch_member_safe(guild, int(user_id))
+    if member is not None:
+        return format_member_reference(member)
+    clean_id = int(user_id)
+    return f"<@{clean_id}>\nDiscord ID: `{clean_id}`"
+
+
+async def format_ticket_topic_user_reference(guild: discord.Guild, user_id: Optional[int]) -> str:
+    """Async readable user label for channel topic/header text."""
+    if not user_id:
+        return "Unknown creator"
+    member = await fetch_member_safe(guild, int(user_id))
+    if member is not None:
+        return format_member_topic_reference(member)
+    clean_id = int(user_id)
+    return f"<@{clean_id}> (Discord ID {clean_id})"
 
 
 def format_log_user_reference(user_id: Optional[int]) -> str:
@@ -722,6 +789,7 @@ def build_ticket_status_embed(
     claimed_by: Optional[int] = None,
     status: str = "Open",
     created_by_text: str = "",
+    claimed_by_text: str = "",
 ) -> discord.Embed:
     """Build the colored ticket card shown at the top of each live ticket."""
     clean_type = "priority" if str(ticket_type).lower() == "priority" else "normal"
@@ -747,9 +815,10 @@ def build_ticket_status_embed(
 
     creator_value = created_by_text or format_user_reference(guild, owner_id)
     embed.add_field(name="Created By", value=creator_value, inline=False)
+    claimed_value = claimed_by_text or (format_user_reference(guild, claimed_by) if claimed_by else "Not claimed yet")
     embed.add_field(
         name="Claimed By",
-        value=format_user_reference(guild, claimed_by) if claimed_by else "Not claimed yet",
+        value=claimed_value,
         inline=False,
     )
     embed.set_footer(text=f"Creator ID: {owner_id}")
@@ -1373,6 +1442,9 @@ async def refresh_ticket_status_message(bot: "TicketBot", channel: discord.TextC
     ticket_number = get_ticket_number(channel)
     claimed_by = get_claimed_by_id(channel)
 
+    created_by_text = await format_user_reference_async(channel.guild, owner_id)
+    claimed_by_text = await format_user_reference_async(channel.guild, claimed_by) if claimed_by else ""
+
     embed = build_ticket_status_embed(
         guild=channel.guild,
         ticket_number=ticket_number,
@@ -1380,6 +1452,8 @@ async def refresh_ticket_status_message(bot: "TicketBot", channel: discord.TextC
         owner_id=owner_id,
         claimed_by=claimed_by,
         status=status,
+        created_by_text=created_by_text,
+        claimed_by_text=claimed_by_text,
     )
 
     bot_user_id = int(getattr(getattr(bot, "user", None), "id", 0) or 0)
@@ -1476,6 +1550,26 @@ def member_is_staff(bot: "TicketBot", member: discord.Member) -> bool:
     return bool(configured_roles & member_role_ids)
 
 
+def can_member_close_ticket(bot: "TicketBot", member: discord.Member, channel: discord.TextChannel) -> tuple[bool, str]:
+    """Return whether a member can close this ticket.
+
+    Ticket creators are intentionally blocked from closing their own tickets so
+    staff must review and finish the case. This applies to both the Close button
+    and `/sclose`, including when `/sclose` is used from the notes thread.
+    """
+    owner_id = get_ticket_owner_id(channel)
+    if owner_id is None:
+        return False, "This does not look like a valid ticket channel."
+
+    if member.id == owner_id:
+        return False, "Ticket creators cannot close their own tickets. A staff member must close this ticket."
+
+    if not member_is_staff(bot, member):
+        return False, "Only ticket staff can close tickets."
+
+    return True, ""
+
+
 def find_open_ticket_for_user(
     categories: discord.CategoryChannel | list[discord.CategoryChannel],
     user_id: int,
@@ -1505,6 +1599,8 @@ async def update_ticket_metadata(
     current_status = status or data.get("status", "open")
     current_claimed_by = claimed_by if claimed_by is not None else int(data.get("claimed_by", "0") or 0)
     current_ping_role_ids = ping_role_ids if ping_role_ids is not None else get_ticket_ping_role_ids(channel)
+    owner_label = await format_ticket_topic_user_reference(channel.guild, owner_id)
+    claimed_label = await format_ticket_topic_user_reference(channel.guild, current_claimed_by) if current_claimed_by else ""
 
     await channel.edit(
         topic=build_ticket_topic(
@@ -1514,6 +1610,8 @@ async def update_ticket_metadata(
             status=current_status,
             claimed_by=current_claimed_by,
             ping_role_ids=current_ping_role_ids,
+            owner_label=owner_label,
+            claimed_label=claimed_label,
         )
     )
 
@@ -2818,6 +2916,7 @@ async def create_ticket_channel(
                 ticket_type=ticket_type,
                 ticket_number=ticket_number,
                 ping_role_ids=ping_role_ids,
+                owner_label=format_member_topic_reference(interaction.user),
             ),
             overwrites=overwrites,
             reason=f"{ticket_type.title()} ticket opened by {interaction.user} ({interaction.user.id})",
@@ -2852,7 +2951,7 @@ async def create_ticket_channel(
         owner_id=interaction.user.id,
         claimed_by=None,
         status="Open",
-        created_by_text=f"{interaction.user.mention}\n`{interaction.user.id}`",
+        created_by_text=format_member_reference(interaction.user),
     )
 
     opening_mentions = mention_roles(ping_roles) if ping_roles else None
@@ -3209,15 +3308,9 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             return
 
         owner_id = get_ticket_owner_id(self.channel)
-        if owner_id is None:
-            await interaction.response.send_message("This does not look like a valid ticket channel.", ephemeral=True)
-            return
-
-        if interaction.user.id != owner_id and not member_is_staff(self.bot, interaction.user):
-            await interaction.response.send_message(
-                "Only the ticket owner or ticket staff can close this ticket.",
-                ephemeral=True,
-            )
+        allowed_to_close, close_denial = can_member_close_ticket(self.bot, interaction.user, self.channel)
+        if not allowed_to_close:
+            await interaction.response.send_message(close_denial, ephemeral=True)
             return
 
         closing_ticket_ids = getattr(self.bot, "closing_ticket_ids", set())
@@ -3565,12 +3658,13 @@ class TicketChannelView(discord.ui.View):
 
         self.bot.ticket_ping_cooldowns[channel.id] = now_utc()
         ping_mentions = mention_roles(ping_roles)
+        requester_text = format_member_reference(interaction.user)
         ping_embed = build_ticket_event_embed(
             title="📣 Staff Attention Requested",
             description=f"{interaction.user.mention} requested staff attention for this ticket.",
             color=ticket_status_color(get_ticket_kind(channel), status="ping"),
         )
-        ping_embed.add_field(name="Requested By", value=f"{interaction.user.mention}\n`{interaction.user.id}`", inline=False)
+        ping_embed.add_field(name="Requested By", value=requester_text, inline=False)
         ping_embed.add_field(name="Ping Roles", value=ping_mentions or "None", inline=False)
         await channel.send(
             content=ping_mentions,
@@ -3684,6 +3778,15 @@ class TicketChannelView(discord.ui.View):
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
             await interaction.response.send_message("This only works in a ticket channel.", ephemeral=True)
+            return
+
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used inside a server.", ephemeral=True)
+            return
+
+        allowed_to_close, close_denial = can_member_close_ticket(self.bot, interaction.user, channel)
+        if not allowed_to_close:
+            await interaction.response.send_message(close_denial, ephemeral=True)
             return
 
         await interaction.response.send_modal(CloseTicketModal(self.bot, channel))
@@ -4280,7 +4383,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="Ticket buttons shown in the private ticket: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket owners cannot claim or unclaim their own tickets. Use `/ticket notes` for staff notes.",
+            value="Ticket buttons shown in the private ticket: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket owners cannot claim, unclaim, or close their own tickets. Use `/ticket notes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
@@ -4651,6 +4754,11 @@ class StarzShortcutCommands(commands.Cog):
                 "Use `/sclose` inside a ticket channel or its staff-notes thread.",
                 ephemeral=True,
             )
+            return
+
+        allowed_to_close, close_denial = can_member_close_ticket(self.bot, interaction.user, ticket_channel)
+        if not allowed_to_close:
+            await interaction.response.send_message(close_denial, ephemeral=True)
             return
 
         await interaction.response.send_modal(CloseTicketModal(self.bot, ticket_channel))
