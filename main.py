@@ -58,6 +58,47 @@ PRIORITY_TICKET_CONFIG: dict[str, str] = {
     "channel_prefix": "priority",
 }
 
+
+DEFAULT_TICKET_PANEL_TITLE = "Open a ticket!"
+DEFAULT_TICKET_PANEL_AUTHOR = "STARZ"
+DEFAULT_TICKET_PANEL_FOOTER = "One open ticket per user."
+DEFAULT_TICKET_PANEL_COLOR_HEX = "#FF00AA"
+DEFAULT_TICKET_PANEL_DESCRIPTION = (
+    "**Please ensure that you only make a ticket when it is necessary:**\n\n"
+    "For information about the server and wipe schedule, please see 📌 #server-list-wipe\n"
+    "For information regarding our rules refer to ‼️ #rules\n\n"
+    "For information about claiming kits ♻️ #auto-kit\n"
+    "To view our shops: 🤑 #starz-shop\n\n"
+    "For information about our offline protection system.\n"
+    "🚧 #offline-protection\n\n"
+    "**If you make a ticket about team size we require the following**\n\n"
+    "A clip of the suspected team being over team limit\n"
+    "Suspected team's usernames (requires just 1)\n\n"
+    "**Tickets will be auto-closed without these.**\n\n"
+    "If you are making a ticket asking to be unlinked we need:\n"
+    "a reason as to why you need unlinked (left Discord / changed gamertag)\n"
+    "proof that you own the account (receipts / screenshots)\n\n"
+    "If you are making a report about over-teaming please provide:\n"
+    "a clip of the team that is over team limit\n"
+    "that team's gamertags\n"
+    "the server this is on\n"
+    "the grid they live\n\n"
+    "**PRIORITY TICKETS!**\n"
+    "Starz Empire Priority Ticket Support\n\n"
+    "These tickets are only accessible to our admin management team:\n"
+    "HEAD ADMINS\n"
+    "ADMIN MANAGEMENT\n\n"
+    "Only available to:\n"
+    "TOP SUPPORTERS\n"
+    "🤑 MEGA SUPPORTER 🤑\n\n"
+    "**USES**\n"
+    "Moves ticket to top of the queue\n"
+    "Professional 1-on-1 customer/player service with our top-ranking admins\n"
+    "Bypass the chain of command and speak to the top-ranking admins/owners\n\n"
+    "Please understand that wait times may be longer as there are a very limited amount of us. "
+    "If you need instant support, consider making a normal ticket as regular admins cannot see these tickets."
+)
+
 ROLE_TARGETS: dict[str, dict[str, str]] = {
     "staff_pool": {
         "config_key": "staff_pool_role_ids",
@@ -959,6 +1000,66 @@ def get_panel_gif_url(bot: "TicketBot", guild_id: int) -> str:
     if saved:
         return saved
     return normalize_panel_image_url(DEFAULT_PANEL_GIF_URL)
+
+
+
+def normalize_panel_text(value: Any, default: str, limit: int) -> str:
+    """Clean ticket panel text while keeping a safe default per Discord embed limits."""
+    clean_value = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not clean_value:
+        clean_value = default
+    return clean_value[:limit]
+
+
+def normalize_panel_color_hex(value: Any, default: str = DEFAULT_TICKET_PANEL_COLOR_HEX) -> str:
+    """Return a safe #RRGGBB value for the ticket panel embed color."""
+    clean_value = str(value or "").strip().upper()
+    if not clean_value:
+        clean_value = default
+    if clean_value.startswith("0X"):
+        clean_value = clean_value[2:]
+    clean_value = clean_value.lstrip("#")
+    if not re.fullmatch(r"[0-9A-F]{6}", clean_value):
+        clean_value = default.lstrip("#").upper()
+    return f"#{clean_value}"
+
+
+def panel_color_from_hex(value: Any) -> discord.Color:
+    clean_value = normalize_panel_color_hex(value).lstrip("#")
+    return discord.Color(int(clean_value, 16))
+
+
+def get_ticket_panel_message_config(bot: "TicketBot", guild_id: int) -> dict[str, str]:
+    """Return this guild's saved ticket panel embed text, falling back to STARZ defaults."""
+    config = bot.config_store.get_guild(guild_id)
+    return {
+        "title": normalize_panel_text(config.get("panel_title"), DEFAULT_TICKET_PANEL_TITLE, 256),
+        "description": normalize_panel_text(config.get("panel_description"), DEFAULT_TICKET_PANEL_DESCRIPTION, 4096),
+        "author": normalize_panel_text(config.get("panel_author"), DEFAULT_TICKET_PANEL_AUTHOR, 256),
+        "footer": normalize_panel_text(config.get("panel_footer"), DEFAULT_TICKET_PANEL_FOOTER, 2048),
+        "color_hex": normalize_panel_color_hex(config.get("panel_color_hex"), DEFAULT_TICKET_PANEL_COLOR_HEX),
+    }
+
+
+def build_ticket_panel_embed(bot: "TicketBot", guild: discord.Guild) -> discord.Embed:
+    """Build the public ticket panel embed using per-server saved settings."""
+    panel_config = get_ticket_panel_message_config(bot, guild.id)
+    embed = discord.Embed(
+        title=panel_config["title"],
+        description=panel_config["description"],
+        color=panel_color_from_hex(panel_config["color_hex"]),
+        timestamp=now_utc(),
+    )
+    if panel_config["author"]:
+        embed.set_author(name=panel_config["author"])
+
+    panel_gif_url = get_panel_gif_url(bot, guild.id)
+    if panel_gif_url:
+        embed.set_image(url=panel_gif_url)
+
+    if panel_config["footer"]:
+        embed.set_footer(text=panel_config["footer"])
+    return embed
 
 
 def normalize_role_target(target: str) -> str:
@@ -3288,6 +3389,78 @@ class AdminPanelGifModal(discord.ui.Modal, title="Set Panel GIF or Image"):
             await interaction.response.send_message("Cleared the saved panel image URL.", ephemeral=True)
 
 
+class TicketPanelMessageModal(discord.ui.Modal):
+    def __init__(self, bot: "TicketBot", guild_id: int):
+        super().__init__(title="Set Ticket Panel Message", timeout=600)
+        self.bot = bot
+        current = get_ticket_panel_message_config(bot, guild_id)
+
+        self.title_input = discord.ui.TextInput(
+            label="Embed title",
+            placeholder=DEFAULT_TICKET_PANEL_TITLE,
+            default=current["title"],
+            required=False,
+            max_length=256,
+        )
+        self.author_input = discord.ui.TextInput(
+            label="Embed author/header",
+            placeholder=DEFAULT_TICKET_PANEL_AUTHOR,
+            default=current["author"],
+            required=False,
+            max_length=256,
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Embed message/body",
+            placeholder="Paste the full ticket panel message for this server.",
+            default=current["description"],
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=4000,
+        )
+        self.footer_input = discord.ui.TextInput(
+            label="Embed footer",
+            placeholder=DEFAULT_TICKET_PANEL_FOOTER,
+            default=current["footer"],
+            required=False,
+            max_length=2048,
+        )
+        self.color_input = discord.ui.TextInput(
+            label="Embed color hex",
+            placeholder=DEFAULT_TICKET_PANEL_COLOR_HEX,
+            default=current["color_hex"],
+            required=False,
+            max_length=20,
+        )
+
+        self.add_item(self.title_input)
+        self.add_item(self.author_input)
+        self.add_item(self.description_input)
+        self.add_item(self.footer_input)
+        self.add_item(self.color_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        color_hex = normalize_panel_color_hex(str(self.color_input.value))
+        self.bot.config_store.update_guild(
+            interaction.guild.id,
+            panel_title=normalize_panel_text(str(self.title_input.value), DEFAULT_TICKET_PANEL_TITLE, 256),
+            panel_author=normalize_panel_text(str(self.author_input.value), DEFAULT_TICKET_PANEL_AUTHOR, 256),
+            panel_description=normalize_panel_text(str(self.description_input.value), DEFAULT_TICKET_PANEL_DESCRIPTION, 4096),
+            panel_footer=normalize_panel_text(str(self.footer_input.value), DEFAULT_TICKET_PANEL_FOOTER, 2048),
+            panel_color_hex=color_hex,
+        )
+
+        preview = build_ticket_panel_embed(self.bot, interaction.guild)
+        await interaction.response.send_message(
+            "Saved the ticket panel embed message for this server. New `/ticket panel` posts will use this text.",
+            embed=preview,
+            ephemeral=True,
+        )
+
+
 class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
     reason = discord.ui.TextInput(
         label="Reason",
@@ -4236,6 +4409,37 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 ephemeral=True,
             )
 
+    @app_commands.command(name="panelmessage", description="Edit the ticket panel embed text/color for this server.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def panel_message(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(TicketPanelMessageModal(self.bot, interaction.guild.id))
+
+    @app_commands.command(name="resetpanelmessage", description="Reset this server's ticket panel embed message to the STARZ default.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def reset_panel_message(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        self.bot.config_store.update_guild(
+            interaction.guild.id,
+            panel_title=DEFAULT_TICKET_PANEL_TITLE,
+            panel_author=DEFAULT_TICKET_PANEL_AUTHOR,
+            panel_description=DEFAULT_TICKET_PANEL_DESCRIPTION,
+            panel_footer=DEFAULT_TICKET_PANEL_FOOTER,
+            panel_color_hex=DEFAULT_TICKET_PANEL_COLOR_HEX,
+        )
+        preview = build_ticket_panel_embed(self.bot, interaction.guild)
+        await interaction.response.send_message(
+            "Reset the ticket panel embed message for this server.",
+            embed=preview,
+            ephemeral=True,
+        )
+
     @app_commands.command(name="settag", description="Create or update a reusable staff tag response.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /ticket tag")
@@ -4381,6 +4585,11 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             inline=False,
         )
         embed.add_field(name="Panel GIF/Image", value=truncate(panel_url, 1024), inline=False)
+        panel_message = get_ticket_panel_message_config(self.bot, interaction.guild.id)
+        embed.add_field(name="Panel Author", value=truncate(panel_message["author"], 1024), inline=True)
+        embed.add_field(name="Panel Title", value=truncate(panel_message["title"], 1024), inline=True)
+        embed.add_field(name="Panel Color", value=panel_message["color_hex"], inline=True)
+        embed.add_field(name="Panel Message Preview", value=truncate(panel_message["description"], 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
             value="Ticket buttons shown in the private ticket: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket owners cannot claim, unclaim, or close their own tickets. Use `/ticket notes` for staff notes.",
@@ -4404,51 +4613,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             )
             return
 
-        embed = discord.Embed(
-            title="Open a ticket!",
-            description=(
-                "**Please ensure that you only make a ticket when it is necessary:**\n\n"
-                "For information about the server and wipe schedule, please see 📌 #server-list-wipe\n"
-                "For information regarding our rules refer to ‼️ #rules\n\n"
-                "For information about claiming kits ♻️ #auto-kit\n"
-                "To view our shops: 🤑 #starz-shop\n\n"
-                "For information about our offline protection system.\n"
-                "🚧 #offline-protection\n\n"
-                "**If you make a ticket about team size we require the following**\n\n"
-                "A clip of the suspected team being over team limit\n"
-                "Suspected team's usernames (requires just 1)\n\n"
-                "**Tickets will be auto-closed without these.**\n\n"
-                "If you are making a ticket asking to be unlinked we need:\n"
-                "a reason as to why you need unlinked (left Discord / changed gamertag)\n"
-                "proof that you own the account (receipts / screenshots)\n\n"
-                "If you are making a report about over-teaming please provide:\n"
-                "a clip of the team that is over team limit\n"
-                "that team's gamertags\n"
-                "the server this is on\n"
-                "the grid they live\n\n"
-                "**PRIORITY TICKETS!**\n"
-                "Starz Empire Priority Ticket Support\n\n"
-                "These tickets are only accessible to our admin management team:\n"
-                "HEAD ADMINS\n"
-                "ADMIN MANAGEMENT\n\n"
-                "Only available to:\n"
-                "TOP SUPPORTERS\n"
-                "🤑 MEGA SUPPORTER 🤑\n\n"
-                "**USES**\n"
-                "Moves ticket to top of the queue\n"
-                "Professional 1-on-1 customer/player service with our top-ranking admins\n"
-                "Bypass the chain of command and speak to the top-ranking admins/owners\n\n"
-                "Please understand that wait times may be longer as there are a very limited amount of us. "
-                "If you need instant support, consider making a normal ticket as regular admins cannot see these tickets."
-            ),
-            color=discord.Color.from_rgb(255, 0, 170),
-            timestamp=now_utc(),
-        )
-        embed.set_author(name="STARZ")
-        panel_gif_url = get_panel_gif_url(self.bot, interaction.guild.id)
-        if panel_gif_url:
-            embed.set_image(url=panel_gif_url)
-        embed.set_footer(text="One open ticket per user.")
+        embed = build_ticket_panel_embed(self.bot, interaction.guild)
 
         await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
         await interaction.followup.send(embed=embed, view=TicketPanelView(self.bot))
