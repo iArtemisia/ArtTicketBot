@@ -1517,7 +1517,7 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
     else:
         embed.add_field(
             name="Ticket-specific tools",
-            value="Run `/ticket admin` inside a ticket channel to edit that ticket's role permissions and ping roles.",
+            value="Run `/ticketadmin` inside a ticket channel to edit that ticket's role permissions and ping roles.",
             inline=False,
         )
 
@@ -1590,7 +1590,7 @@ async def get_ticket_category(
     Normal tickets use ticket_category_id. Priority tickets can use
     priority_ticket_category_id. If no priority category is configured,
     priority tickets fall back to the normal ticket category so existing
-    setups keep working until an admin runs `/ticket prioritycategory`.
+    setups keep working until an admin runs `/ticketprioritycategory`.
     """
     config = bot.config_store.get_guild(guild.id)
     category_id = 0
@@ -2896,7 +2896,7 @@ async def create_or_get_notes_thread(
             return None, (
                 "I could not create a private notes thread under this ticket.\n\n"
                 "Give the bot **Create Private Threads**, **Send Messages in Threads**, and **Manage Threads** "
-                "inside the ticket category/channel, then run `/ticket notes` again. I did **not** create a separate notes channel, "
+                "inside the ticket category/channel, then run `/ticketnotes` again. I did **not** create a separate notes channel, "
                 "so notes will not be grouped with other tickets."
             )
         except discord.HTTPException as exc:
@@ -2905,7 +2905,7 @@ async def create_or_get_notes_thread(
         return None, (
             "I could not create a private notes thread under this ticket.\n\n"
             "Give the bot **Create Private Threads**, **Send Messages in Threads**, and **Manage Threads** "
-            "inside the ticket category/channel, then run `/ticket notes` again. I did **not** create a separate notes channel, "
+            "inside the ticket category/channel, then run `/ticketnotes` again. I did **not** create a separate notes channel, "
             "so notes will not be grouped with other tickets."
         )
     except discord.HTTPException as exc:
@@ -2936,7 +2936,7 @@ async def create_ticket_channel(
         return None, "This can only be used inside a server."
 
     if not bot.config_store.is_ready(interaction.guild.id):
-        return None, "This server is not configured yet. An admin should run /ticket setup first."
+        return None, "This server is not configured yet. An admin should run /ticketsetup first."
 
     if priority and not member_can_open_priority(bot, interaction.user):
         allowed_roles = get_priority_allowed_roles(bot, interaction.guild)
@@ -2946,8 +2946,8 @@ async def create_ticket_channel(
     category = await get_ticket_category(bot, interaction.guild, priority=priority)
     if category is None:
         if priority:
-            return None, "The configured priority ticket category no longer exists. Run `/ticket prioritycategory` or `/ticket setup` again."
-        return None, "The configured normal ticket category no longer exists. Run `/ticket setup` again."
+            return None, "The configured priority ticket category no longer exists. Run `/ticketprioritycategory` or `/ticketsetup` again."
+        return None, "The configured normal ticket category no longer exists. Run `/ticketsetup` again."
 
     lookup_categories = await get_ticket_lookup_categories(bot, interaction.guild)
     existing = find_open_ticket_for_user(lookup_categories or [category], interaction.user.id)
@@ -2995,7 +2995,19 @@ async def create_ticket_channel(
             attach_files=True,
         )
 
-    for role in visible_roles:
+    # Give both access roles and ping roles permission to see/respond in the ticket.
+    # Some servers keep ping roles separate from access roles; if the role cannot
+    # view the private channel, Discord may display the role text but not notify
+    # the staff team reliably.
+    ticket_role_overwrites: list[discord.Role] = []
+    seen_ticket_role_ids: set[int] = set()
+    for role in [*visible_roles, *ping_roles]:
+        if role.id in seen_ticket_role_ids:
+            continue
+        seen_ticket_role_ids.add(role.id)
+        ticket_role_overwrites.append(role)
+
+    for role in ticket_role_overwrites:
         overwrites[role] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
@@ -3055,19 +3067,42 @@ async def create_ticket_channel(
         created_by_text=format_member_reference(interaction.user),
     )
 
-    opening_mentions = mention_roles(ping_roles) if ping_roles else None
+    opening_mentions = mention_roles(ping_roles) if ping_roles else ""
 
     try:
         await channel.send(
-            content=opening_mentions,
             embed=embed,
             view=TicketChannelView(bot),
-            allowed_mentions=discord.AllowedMentions(roles=True, users=False),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
     except discord.Forbidden:
         return None, "I created the channel but couldn't post the starter message. Check the category/channel permissions."
     except discord.HTTPException:
         return None, "I created the channel but Discord rejected the starter message."
+
+    if ping_roles and opening_mentions:
+        staff_alert = build_ticket_event_embed(
+            title="🎫 New Ticket Opened",
+            description=(
+                f"A **{ticket_type.title()}** ticket was opened: {channel.mention}\n"
+                f"**Ticket #:** `{ticket_number}`\n"
+                f"**Opened by:** {interaction.user.mention} (`{interaction.user.id}`)\n\n"
+                "Staff role ping sent from this separate alert message so Discord treats it as a real notification."
+            ),
+            color=ticket_status_color(ticket_type, status="attention"),
+        )
+        try:
+            # Let Discord finish applying private-channel overwrites before the role ping fires.
+            await asyncio.sleep(1.25)
+            await channel.send(
+                content=opening_mentions,
+                embed=staff_alert,
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+            )
+        except discord.HTTPException:
+            # The ticket itself was created successfully; do not fail the whole flow
+            # just because the staff alert could not be sent. Staff can still use Ping Team.
+            pass
 
     bot.stats_store.record_open(
         guild.id,
@@ -3455,7 +3490,7 @@ class TicketPanelMessageModal(discord.ui.Modal):
 
         preview = build_ticket_panel_embed(self.bot, interaction.guild)
         await interaction.response.send_message(
-            "Saved the ticket panel embed message for this server. New `/ticket panel` posts will use this text.",
+            "Saved the ticket panel embed message for this server. New `/ticketpanel` posts will use this text.",
             embed=preview,
             ephemeral=True,
         )
@@ -3824,7 +3859,7 @@ class TicketChannelView(discord.ui.View):
         ping_roles = get_ticket_ping_roles(self.bot, interaction.guild, channel)
         if not ping_roles:
             await interaction.response.send_message(
-                "No ticket ping roles are set. Staff can configure ping roles from `/ticket admin`.",
+                "No ticket ping roles are set. Staff can configure ping roles from `/ticketadmin`.",
                 ephemeral=True,
             )
             return
@@ -4154,13 +4189,12 @@ class TicketAdminPanelView(discord.ui.View):
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.edit_message(embed=embed, view=self)
 
-@app_commands.guild_only()
-class TicketCommands(commands.GroupCog, group_name="ticket", group_description="Ticket bot commands"):
+class TicketCommands(commands.Cog):
     def __init__(self, bot: "TicketBot"):
         self.bot = bot
         super().__init__()
 
-    @app_commands.command(name="setup", description="Set the ticket category and closed-ticket log channel for this server.")
+    @app_commands.command(name="ticketsetup", description="Set the ticket category and closed-ticket log channel for this server.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         category="Category where private ticket channels will be created",
@@ -4240,19 +4274,19 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 f"**Normal ticket category:** {real_category.name}\n"
                 "Used for newly created normal/private ticket channels.\n\n"
                 f"**Priority ticket category:** {priority_category_text}\n"
-                "Run `/ticket prioritycategory` to place priority tickets in a separate category.\n\n"
+                "Run `/ticketprioritycategory` to place priority tickets in a separate category.\n\n"
                 f"**Closed-ticket log channel:** {real_log_channel.mention}\n"
                 "Used when tickets close. The transcript file will be posted there automatically.\n\n"
                 f"**Normal access roles configured:** {len(config.get('staff_role_ids', []))}\n"
                 f"**Priority access roles configured:** {len(config.get('priority_staff_role_ids', []))}\n"
                 f"**Priority opener roles configured:** {len(config.get('priority_allowed_role_ids', []))}\n\n"
-                "Run `/ticket admin` to configure pings/access with dropdowns.\n"
-                "Run `/ticket panel` in the channel where you want the ticket embed posted."
+                "Run `/ticketadmin` to configure pings/access with dropdowns.\n"
+                "Run `/ticketpanel` in the channel where you want the ticket embed posted."
             ),
             ephemeral=True,
         )
 
-    @app_commands.command(name="prioritycategory", description="Set a separate category for priority tickets.")
+    @app_commands.command(name="ticketprioritycategory", description="Set a separate category for priority tickets.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(category="Category where priority ticket channels will be created")
     async def set_priority_category(
@@ -4290,12 +4324,12 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             (
                 "Saved the separate priority ticket category.\n\n"
                 f"**Priority tickets** will now be created in: {real_category.mention}\n"
-                "**Normal tickets** will still use the normal ticket category from `/ticket setup`."
+                "**Normal tickets** will still use the normal ticket category from `/ticketsetup`."
             ),
             ephemeral=True,
         )
 
-    @app_commands.command(name="clearprioritycategory", description="Make priority tickets use the normal ticket category again.")
+    @app_commands.command(name="ticketclearprioritycategory", description="Make priority tickets use the normal ticket category again.")
     @app_commands.default_permissions(manage_guild=True)
     async def clear_priority_category(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4312,7 +4346,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="addstaff", description="Add a normal ticket access role.")
+    @app_commands.command(name="ticketaddstaff", description="Add a normal ticket access role.")
     @app_commands.default_permissions(manage_guild=True)
     async def add_staff(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
@@ -4325,7 +4359,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="removestaff", description="Remove a normal ticket access role.")
+    @app_commands.command(name="ticketremovestaff", description="Remove a normal ticket access role.")
     @app_commands.default_permissions(manage_guild=True)
     async def remove_staff(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
@@ -4338,7 +4372,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="addpingrole", description="Add a normal ticket ping role.")
+    @app_commands.command(name="ticketaddpingrole", description="Add a normal ticket ping role.")
     @app_commands.default_permissions(manage_guild=True)
     async def add_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
@@ -4351,7 +4385,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="removepingrole", description="Remove a normal ticket ping role.")
+    @app_commands.command(name="ticketremovepingrole", description="Remove a normal ticket ping role.")
     @app_commands.default_permissions(manage_guild=True)
     async def remove_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if interaction.guild is None:
@@ -4364,7 +4398,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="panelgif", description="Set or clear the GIF/image shown on the ticket panel.")
+    @app_commands.command(name="ticketpanelgif", description="Set or clear the GIF/image shown on the ticket panel.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         image_url="Direct image URL. Imgur page URLs are also accepted. Leave blank to clear.",
@@ -4409,7 +4443,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
                 ephemeral=True,
             )
 
-    @app_commands.command(name="panelmessage", description="Edit the ticket panel embed text/color for this server.")
+    @app_commands.command(name="ticketpanelmessage", description="Edit the ticket panel embed text/color for this server.")
     @app_commands.default_permissions(manage_guild=True)
     async def panel_message(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4418,7 +4452,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         await interaction.response.send_modal(TicketPanelMessageModal(self.bot, interaction.guild.id))
 
-    @app_commands.command(name="resetpanelmessage", description="Reset this server's ticket panel embed message to the STARZ default.")
+    @app_commands.command(name="ticketresetpanelmessage", description="Reset this server's ticket panel embed message to the STARZ default.")
     @app_commands.default_permissions(manage_guild=True)
     async def reset_panel_message(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4440,9 +4474,9 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="settag", description="Create or update a reusable staff tag response.")
+    @app_commands.command(name="ticketsettag", description="Create or update a reusable staff tag response.")
     @app_commands.default_permissions(manage_guild=True)
-    @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /ticket tag")
+    @app_commands.describe(name="Short tag name, like rules or payment", response="Message the bot should send when staff uses /tickettag")
     async def set_tag_command(self, interaction: discord.Interaction, name: str, response: str) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -4454,9 +4488,9 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             return
 
         set_tag(self.bot, interaction.guild.id, clean_name, response)
-        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can now use `/tag send name:{clean_name}` inside tickets.", ephemeral=True)
+        await interaction.response.send_message(f"Saved tag `{clean_name}`. Staff can now use `/tagsend name:{clean_name}` inside tickets.", ephemeral=True)
 
-    @app_commands.command(name="removetag", description="Remove a reusable staff tag response.")
+    @app_commands.command(name="ticketremovetag", description="Remove a reusable staff tag response.")
     @app_commands.default_permissions(manage_guild=True)
     async def remove_tag_command(self, interaction: discord.Interaction, name: str) -> None:
         if interaction.guild is None:
@@ -4470,7 +4504,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         else:
             await interaction.response.send_message(f"No tag named `{clean_name}` was found.", ephemeral=True)
 
-    @app_commands.command(name="tags", description="List saved staff tag responses for this server.")
+    @app_commands.command(name="tickettags", description="List saved staff tag responses for this server.")
     @app_commands.default_permissions(manage_messages=True)
     async def list_tags_command(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4479,13 +4513,13 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         tags = get_tags(self.bot, interaction.guild.id)
         if not tags:
-            await interaction.response.send_message("No tags are saved yet. Use `/tag admin` first.", ephemeral=True)
+            await interaction.response.send_message("No tags are saved yet. Use `/tagadmin` first.", ephemeral=True)
             return
 
         lines = [f"`{name}` — {truncate(value, 120)}" for name, value in sorted(tags.items())]
         await interaction.response.send_message("Saved tags:\n" + "\n".join(lines), ephemeral=True)
 
-    @app_commands.command(name="tag", description="Send a saved staff tag response inside a ticket.")
+    @app_commands.command(name="tickettag", description="Send a saved staff tag response inside a ticket.")
     @app_commands.default_permissions(manage_messages=True)
     @app_commands.autocomplete(name=saved_tag_autocomplete)
     async def send_tag_command(self, interaction: discord.Interaction, name: str) -> None:
@@ -4495,18 +4529,18 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("Use `/tag send` inside a ticket channel.", ephemeral=True)
+            await interaction.response.send_message("Use `/tagsend` inside a ticket channel.", ephemeral=True)
             return
 
         clean_name = clean_tag_name(name)
         response = get_tags(self.bot, interaction.guild.id).get(clean_name)
         if not response:
-            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/tag list` to view saved tags.", ephemeral=True)
+            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/taglist` to view saved tags.", ephemeral=True)
             return
 
         await interaction.response.send_message(response, allowed_mentions=discord.AllowedMentions.none())
 
-    @app_commands.command(name="notes", description="Create or open the staff-only notes thread for this ticket.")
+    @app_commands.command(name="ticketnotes", description="Create or open the staff-only notes thread for this ticket.")
     @app_commands.default_permissions(manage_messages=True)
     async def ticket_notes(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -4515,7 +4549,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("Use `/ticket notes` inside a ticket channel.", ephemeral=True)
+            await interaction.response.send_message("Use `/ticketnotes` inside a ticket channel.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -4541,7 +4575,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(name="admin", description="Open the ticket admin control panel.")
+    @app_commands.command(name="ticketadmin", description="Open the ticket admin control panel.")
     @app_commands.default_permissions(manage_guild=True)
     async def ticket_admin(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4551,7 +4585,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.send_message(embed=embed, view=TicketAdminPanelView(self.bot), ephemeral=True)
 
-    @app_commands.command(name="config", description="Show the ticket configuration for this server.")
+    @app_commands.command(name="ticketconfig", description="Show the ticket configuration for this server.")
     @app_commands.default_permissions(manage_guild=True)
     async def show_config(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4592,14 +4626,14 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         embed.add_field(name="Panel Message Preview", value=truncate(panel_message["description"], 1024), inline=False)
         embed.add_field(
             name="In-ticket controls",
-            value="Ticket buttons shown in the private ticket: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket owners cannot claim, unclaim, or close their own tickets. Use `/ticket notes` for staff notes.",
+            value="Ticket buttons shown in the private ticket: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket owners cannot claim, unclaim, or close their own tickets. Use `/ticketnotes` for staff notes.",
             inline=False,
         )
         embed.add_field(name="Ready", value="Yes" if self.bot.config_store.is_ready(interaction.guild.id) else "No", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="panel", description="Post the ticket panel in the current channel.")
+    @app_commands.command(name="ticketpanel", description="Post the ticket panel in the current channel.")
     @app_commands.default_permissions(manage_guild=True)
     async def ticket_panel(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4608,7 +4642,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
 
         if not self.bot.config_store.is_ready(interaction.guild.id):
             await interaction.response.send_message(
-                "This server is not configured yet. Run `/ticket setup` and configure normal access roles first.",
+                "This server is not configured yet. Run `/ticketsetup` and configure normal access roles first.",
                 ephemeral=True,
             )
             return
@@ -4618,7 +4652,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
         await interaction.followup.send(embed=embed, view=TicketPanelView(self.bot))
 
-    @app_commands.command(name="ping", description="Check if the ticket bot is online.")
+    @app_commands.command(name="ticketping", description="Check if the ticket bot is online.")
     @app_commands.default_permissions(send_messages=True)
     async def ticket_ping(self, interaction: discord.Interaction) -> None:
         latency_ms = round(self.bot.latency * 1000)
@@ -4630,7 +4664,7 @@ class TicketCommands(commands.GroupCog, group_name="ticket", group_description="
         elif isinstance(error, app_commands.TransformerError):
             message = (
                 "A selected option could not be read correctly.\n\n"
-                "For `/ticket setup` and `/ticket prioritycategory`:\n"
+                "For `/ticketsetup` and `/ticketprioritycategory`:\n"
                 "- `category` must be a real Discord category\n"
                 "- `log_channel` must be a normal text channel for closed ticket logs/transcripts"
             )
@@ -4651,7 +4685,7 @@ class TagCreateModal(discord.ui.Modal, title="Create Tag"):
     )
     response_input = discord.ui.TextInput(
         label="Tag response",
-        placeholder="Message to send when staff uses /tag send",
+        placeholder="Message to send when staff uses /tagsend",
         style=discord.TextStyle.paragraph,
         max_length=1900,
     )
@@ -4747,7 +4781,7 @@ def build_tag_admin_embed(bot: "TicketBot", guild: discord.Guild) -> discord.Emb
         title="Tag Admin Panel",
         description=(
             "Create, edit, or delete reusable ticket responses.\n\n"
-            "Use `/tag send` inside a ticket to send one of these saved responses."
+            "Use `/tagsend` inside a ticket to send one of these saved responses."
         ),
         color=discord.Color.blurple(),
         timestamp=now_utc(),
@@ -4796,13 +4830,12 @@ class TagAdminPanelView(discord.ui.View):
         await interaction.response.edit_message(embed=build_tag_admin_embed(self.bot, interaction.guild), view=self)
 
 
-@app_commands.guild_only()
-class TagCommands(commands.GroupCog, group_name="tag", group_description="Reusable ticket tag responses"):
+class TagCommands(commands.Cog):
     def __init__(self, bot: "TicketBot"):
         self.bot = bot
         super().__init__()
 
-    @app_commands.command(name="admin", description="Open the tag admin panel.")
+    @app_commands.command(name="tagadmin", description="Open the tag admin panel.")
     @app_commands.default_permissions(manage_guild=True)
     async def tag_admin(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4814,7 +4847,7 @@ class TagCommands(commands.GroupCog, group_name="tag", group_description="Reusab
             ephemeral=True,
         )
 
-    @app_commands.command(name="send", description="Send a saved tag response inside a ticket.")
+    @app_commands.command(name="tagsend", description="Send a saved tag response inside a ticket.")
     @app_commands.default_permissions(manage_messages=True)
     @app_commands.autocomplete(name=saved_tag_autocomplete)
     async def tag_send(self, interaction: discord.Interaction, name: str) -> None:
@@ -4823,16 +4856,16 @@ class TagCommands(commands.GroupCog, group_name="tag", group_description="Reusab
             return
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
-            await interaction.response.send_message("Use `/tag send` inside a ticket channel.", ephemeral=True)
+            await interaction.response.send_message("Use `/tagsend` inside a ticket channel.", ephemeral=True)
             return
         clean_name = clean_tag_name(name)
         response = get_tags(self.bot, interaction.guild.id).get(clean_name)
         if not response:
-            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/tag list` to view saved tags.", ephemeral=True)
+            await interaction.response.send_message(f"No tag named `{clean_name}` was found. Use `/taglist` to view saved tags.", ephemeral=True)
             return
         await interaction.response.send_message(response, allowed_mentions=discord.AllowedMentions.none())
 
-    @app_commands.command(name="list", description="List saved tag responses for this server.")
+    @app_commands.command(name="taglist", description="List saved tag responses for this server.")
     @app_commands.default_permissions(manage_messages=True)
     async def tag_list(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -4842,13 +4875,12 @@ class TagCommands(commands.GroupCog, group_name="tag", group_description="Reusab
         await interaction.response.send_message(format_tag_list_for_embed(tags), ephemeral=True)
 
 
-@app_commands.guild_only()
-class StatsCommands(commands.GroupCog, group_name="stats", group_description="Ticket staff statistics"):
+class StatsCommands(commands.Cog):
     def __init__(self, bot: "TicketBot"):
         self.bot = bot
         super().__init__()
 
-    @app_commands.command(name="user", description="Show ticket stats for a staff member.")
+    @app_commands.command(name="statsuser", description="Show ticket stats for a staff member.")
     @app_commands.default_permissions(manage_messages=True)
     @app_commands.describe(member="Staff member to check. Leave blank to check yourself.")
     async def stats_user(self, interaction: discord.Interaction, member: Optional[discord.Member] = None) -> None:
@@ -4880,7 +4912,7 @@ class StatsCommands(commands.GroupCog, group_name="stats", group_description="Ti
         embed.set_footer(text=f"User ID: {target.id}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="leaderboard", description="Show ticket staff leaderboard stats.")
+    @app_commands.command(name="statsleaderboard", description="Show ticket staff leaderboard stats.")
     @app_commands.default_permissions(manage_messages=True)
     async def stats_leaderboard(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
