@@ -24,11 +24,10 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRANSCRIPT_ASCII_SAFE = os.getenv("TRANSCRIPT_ASCII_SAFE", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRANSCRIPT_INCLUDE_BOT_EVENTS = os.getenv("TRANSCRIPT_INCLUDE_BOT_EVENTS", "true").strip().lower() in {"1", "true", "yes", "on"}
-TRANSCRIPT_HTML_ENABLED = os.getenv("TRANSCRIPT_HTML_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-# Discord previews .txt attachments as plain text. By default, attach the colored
-# .html transcript only so staff open the colorized version first. The plain text
-# transcript is still saved locally in data/ticket_logs.
-TRANSCRIPT_TEXT_ATTACHMENT_ENABLED = os.getenv("TRANSCRIPT_TEXT_ATTACHMENT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+# Colored HTML transcript attachments are disabled by default. Mobile Discord
+# made them harder to review, so closed tickets attach the plain .txt transcript.
+TRANSCRIPT_HTML_ENABLED = os.getenv("TRANSCRIPT_HTML_ENABLED", "false").strip().lower() not in {"0", "false", "no", "off"}
+TRANSCRIPT_TEXT_ATTACHMENT_ENABLED = os.getenv("TRANSCRIPT_TEXT_ATTACHMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 # STARZ ticket colors. Discord only supports the embed side-strip color and the
 # built-in button styles, so these colors are applied to ticket embeds/events.
@@ -1175,6 +1174,24 @@ def get_ticket_ping_roles(bot: "TicketBot", guild: discord.Guild, channel: disco
 
 def mention_roles(roles: list[discord.Role]) -> str:
     return " ".join(f"<@&{role.id}>" for role in roles)
+
+
+def unique_roles(*role_lists: list[discord.Role]) -> list[discord.Role]:
+    """Return unique non-default roles while preserving order."""
+    result: list[discord.Role] = []
+    seen: set[int] = set()
+    for role_list in role_lists:
+        for role in role_list:
+            if role is None or role.is_default() or role.id in seen:
+                continue
+            seen.add(role.id)
+            result.append(role)
+    return result
+
+
+def role_allowed_mentions(roles: list[discord.Role]) -> discord.AllowedMentions:
+    """Allow exactly these role mentions to parse for ticket alerts."""
+    return discord.AllowedMentions(everyone=False, users=False, roles=roles)
 
 
 def get_ticket_extra_roles(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Role]:
@@ -2962,11 +2979,15 @@ async def create_ticket_channel(
 
     if priority:
         visible_roles = get_priority_staff_roles(bot, guild)
-        ping_roles = get_priority_ping_roles(bot, guild)
+        configured_ping_roles = get_priority_ping_roles(bot, guild)
     else:
         visible_roles = get_staff_roles(bot, guild)
-        ping_roles = get_guild_ping_roles(bot, guild)
+        configured_ping_roles = get_guild_ping_roles(bot, guild)
 
+    # Roles that should be notified when the ticket opens.
+    # If no dedicated ping role is configured, fall back to the ticket access roles
+    # so staff still gets alerted instead of silently creating an unannounced ticket.
+    ping_roles = unique_roles(configured_ping_roles) if configured_ping_roles else unique_roles(visible_roles)
     ping_role_ids = [role.id for role in ping_roles]
 
     overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
@@ -2999,13 +3020,7 @@ async def create_ticket_channel(
     # Some servers keep ping roles separate from access roles; if the role cannot
     # view the private channel, Discord may display the role text but not notify
     # the staff team reliably.
-    ticket_role_overwrites: list[discord.Role] = []
-    seen_ticket_role_ids: set[int] = set()
-    for role in [*visible_roles, *ping_roles]:
-        if role.id in seen_ticket_role_ids:
-            continue
-        seen_ticket_role_ids.add(role.id)
-        ticket_role_overwrites.append(role)
+    ticket_role_overwrites = unique_roles(visible_roles, ping_roles)
 
     for role in ticket_role_overwrites:
         overwrites[role] = discord.PermissionOverwrite(
@@ -3087,17 +3102,23 @@ async def create_ticket_channel(
                 f"A **{ticket_type.title()}** ticket was opened: {channel.mention}\n"
                 f"**Ticket #:** `{ticket_number}`\n"
                 f"**Opened by:** {interaction.user.mention} (`{interaction.user.id}`)\n\n"
-                "Staff role ping sent from this separate alert message so Discord treats it as a real notification."
+                "Staff were pinged in the plain role-mention message above this embed."
             ),
             color=ticket_status_color(ticket_type, status="attention"),
         )
         try:
             # Let Discord finish applying private-channel overwrites before the role ping fires.
-            await asyncio.sleep(1.25)
+            await asyncio.sleep(0.75)
+
+            # Send the role mention as its own plain message. This mirrors the working
+            # Ping Team button instead of hiding the mention inside the starter card/embed.
             await channel.send(
                 content=opening_mentions,
+                allowed_mentions=role_allowed_mentions(ping_roles),
+            )
+            await channel.send(
                 embed=staff_alert,
-                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.HTTPException:
             # The ticket itself was created successfully; do not fail the whole flow
@@ -3533,7 +3554,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         self.bot.closing_ticket_ids = closing_ticket_ids
 
         reason_text = str(self.reason.value).strip() or "No reason provided."
-        await interaction.response.send_message("Closing the ticket and saving transcript...", ephemeral=True)
+        await interaction.response.send_message("Saving transcript and closing this ticket...", ephemeral=True)
 
         claimed_by = get_claimed_by_id(self.channel) or 0
         ping_role_ids = get_ticket_ping_role_ids(self.channel)
@@ -3577,51 +3598,16 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
                 f"{safe_filename_part(self.channel.name, 48)}-transcript"
             )[:140]
 
-            # Try the colored HTML transcript first. If Discord rejects it because
-            # of size/type/network problems, retry with the plain-text transcript
-            # so closing is not blocked by the optional colored copy.
-            if TRANSCRIPT_HTML_ENABLED:
-                try:
-                    transcript_html = build_colored_transcript_html(
-                        transcript_text,
-                        page_title=f"STARZ Ticket #{ticket_number} Transcript",
-                    )
-                    files = [transcript_file_from_html(transcript_html, f"colored-{safe_base_name}.html")]
-                    if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED:
-                        files.append(transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"))
-                    await asyncio.wait_for(log_channel.send(embed=embed, files=files), timeout=30)
-                    return True, ""
-                except discord.Forbidden:
-                    return False, f"I do not have permission to send embeds/files in {log_channel.mention}."
-                except (discord.HTTPException, asyncio.TimeoutError, ValueError, OSError) as exc:
-                    html_error = truncate(str(exc), 350)
-
-                    try:
-                        fallback_embed = embed.copy()
-                        fallback_embed.set_footer(text="Colored HTML transcript failed to upload, so a plain .txt transcript was attached instead.")
-                        await asyncio.wait_for(
-                            log_channel.send(
-                                embed=fallback_embed,
-                                file=transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"),
-                            ),
-                            timeout=30,
-                        )
-                        return True, ""
-                    except discord.Forbidden:
-                        return False, f"I do not have permission to send embeds/files in {log_channel.mention}."
-                    except (discord.HTTPException, asyncio.TimeoutError, ValueError, OSError) as fallback_exc:
-                        return False, (
-                            "Discord rejected both transcript uploads. "
-                            f"HTML error: `{html_error}` | TXT error: `{truncate(str(fallback_exc), 350)}`"
-                        )
-
+            # Mobile Discord made the colored HTML copy more trouble than it was
+            # worth. Attach only the plain text transcript and keep the ticket/log
+            # embeds colored.
             try:
                 await asyncio.wait_for(
                     log_channel.send(
                         embed=embed,
-                        file=transcript_file_from_text(transcript_text, f"plain-{safe_base_name}.txt"),
+                        file=transcript_file_from_text(transcript_text, f"{safe_base_name}.txt"),
                     ),
-                    timeout=30,
+                    timeout=12,
                 )
                 return True, ""
             except discord.Forbidden:
@@ -3699,12 +3685,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
                     value=format_notes_sources_for_embed(notes_thread, legacy_notes_channels),
                     inline=False,
                 )
-            footer_text = "Open the .html attachment for the colored transcript."
-            if TRANSCRIPT_TEXT_ATTACHMENT_ENABLED:
-                footer_text += " Plain .txt fallback is also attached."
-            else:
-                footer_text += " If HTML upload fails, a plain .txt transcript is attached automatically."
-            embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • {footer_text}")
+            embed.set_footer(text=f"Closed at {closed_at.strftime('%Y-%m-%d %H:%M:%S UTC')} • Plain text transcript attached")
 
             log_sent = False
             log_error = ""
@@ -3748,7 +3729,6 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
                 clear_notes_thread_id(self.bot, interaction.guild.id, self.channel.id)
 
             await safe_followup("Transcript saved. Deleting this ticket channel now.")
-            await asyncio.sleep(4)
             try:
                 await self.channel.delete(reason=f"Ticket closed by {interaction.user} ({interaction.user.id})")
             except discord.Forbidden:
@@ -3877,7 +3857,7 @@ class TicketChannelView(discord.ui.View):
         await channel.send(
             content=ping_mentions,
             embed=ping_embed,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            allowed_mentions=role_allowed_mentions(ping_roles),
         )
         await interaction.response.send_message("Pinged the configured ticket roles. This ticket can ping again in 10 minutes.", ephemeral=True)
 
