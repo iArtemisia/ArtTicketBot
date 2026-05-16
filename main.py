@@ -42,6 +42,7 @@ DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
 TICKET_STATS_PATH = Path(os.getenv("TICKET_STATS_PATH", str(CONFIG_PATH.parent / "ticket_stats.json")))
 TICKET_PING_COOLDOWN_SECONDS = 10 * 60
+TICKET_TEMP_ENABLE_ROLE_MENTIONS = os.getenv("TICKET_TEMP_ENABLE_ROLE_MENTIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 TICKET_CONFIG: dict[str, str] = {
     "label": "Open Ticket",
@@ -1158,14 +1159,6 @@ def get_priority_ping_roles(bot: "TicketBot", guild: discord.Guild) -> list[disc
 def member_can_open_priority(bot: "TicketBot", member: discord.Member) -> bool:
     if member.guild_permissions.administrator or member.guild_permissions.manage_channels:
         return True
-
-    # Ticket staff should always be able to open/test priority tickets even if
-    # they do not have Manage Channels. This prevents priority tickets from
-    # appearing broken for admins whose authority comes from configured staff
-    # roles rather than Discord's channel-management permission.
-    if member_is_staff(bot, member):
-        return True
-
     allowed_role_ids = set(get_role_ids_from_config(bot, member.guild.id, "priority_allowed"))
     member_role_ids = {role.id for role in member.roles}
     return bool(allowed_role_ids & member_role_ids)
@@ -1197,17 +1190,112 @@ def unique_roles(*role_lists: list[discord.Role]) -> list[discord.Role]:
     return result
 
 
-def role_allowed_mentions(roles: list[discord.Role]) -> discord.AllowedMentions:
-    """Allow role mentions in messages that only contain vetted ticket roles.
+def role_allowed_mentions(roles: list[discord.Role] | None = None) -> discord.AllowedMentions:
+    """Allow role mentions to parse for ticket alerts.
 
-    The caller still controls the actual content, so this does not ping random
-    roles unless they were placed in the message content by the bot. Using
-    roles=True is more reliable across discord.py versions than passing Role
-    objects, and it matches the behavior needed for non-mentionable staff roles
-    when the bot has the Discord "Mention @everyone, @here, and All Roles"
-    permission.
+    Using roles=True is more reliable across discord.py versions than passing
+    Role objects here. The message content is still built only from the roles
+    we chose, so this does not mention random roles.
     """
     return discord.AllowedMentions(everyone=False, users=False, roles=True)
+
+
+def bot_can_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
+    """Return whether this bot can temporarily toggle a role's mentionable state."""
+    me = guild.me
+    if me is None or role.is_default() or role.managed:
+        return False
+    return bool(me.guild_permissions.manage_roles and me.top_role > role)
+
+
+async def send_role_ping_message(
+    channel: discord.TextChannel,
+    roles: list[discord.Role],
+    *,
+    content_prefix: str = "",
+    embed: Optional[discord.Embed] = None,
+    reason: str = "Ticket role ping",
+) -> tuple[bool, str]:
+    """Send a role ping in the most reliable way this bot can.
+
+    Discord will only notify a role mention when either:
+    - the sender has Mention Everyone/All Roles permission, or
+    - the target role is currently mentionable.
+
+    Some servers keep staff roles non-mentionable, so this briefly toggles the
+    target roles mentionable while the bot sends the alert, then restores them.
+    If the bot cannot manage a role, the message is still sent and a warning is
+    returned so admins know what permission/hierarchy is blocking true pings.
+    """
+    ping_roles = unique_roles(roles)
+    if not ping_roles:
+        return False, "No roles were provided for the ping."
+
+    mentions = mention_roles(ping_roles)
+    clean_prefix = str(content_prefix or "").strip()
+    content = f"{clean_prefix} {mentions}".strip() if clean_prefix else mentions
+
+    toggled: list[tuple[discord.Role, bool]] = []
+    blocked_roles: list[discord.Role] = []
+
+    # If the bot lacks Mention Everyone/All Roles in this channel, non-mentionable
+    # roles will render but will not actually notify. Temporarily enabling the
+    # role mention closes that gap when the bot has Manage Roles and hierarchy.
+    bot_member = channel.guild.me
+    channel_perms = channel.permissions_for(bot_member) if bot_member is not None else None
+    bot_can_mention_all_roles = bool(getattr(channel_perms, "mention_everyone", False))
+
+    if TICKET_TEMP_ENABLE_ROLE_MENTIONS:
+        for role in ping_roles:
+            if role.mentionable:
+                continue
+            if not bot_can_manage_role(channel.guild, role):
+                blocked_roles.append(role)
+                continue
+            try:
+                original = bool(role.mentionable)
+                await role.edit(mentionable=True, reason=reason)
+                toggled.append((role, original))
+            except (discord.Forbidden, discord.HTTPException):
+                blocked_roles.append(role)
+
+        if toggled:
+            await asyncio.sleep(0.35)
+
+    try:
+        await channel.send(
+            content=content,
+            embed=embed,
+            allowed_mentions=role_allowed_mentions(ping_roles),
+        )
+    except discord.Forbidden as exc:
+        return False, f"I do not have permission to send the role ping in {channel.mention}: `{truncate(str(exc), 250)}`"
+    except discord.HTTPException as exc:
+        return False, f"Discord rejected the role ping message: `{truncate(str(exc), 250)}`"
+    finally:
+        # Restore role mentionability even if the send fails.
+        for role, original in toggled:
+            try:
+                await role.edit(mentionable=original, reason=f"{reason} restore")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    if blocked_roles and not bot_can_mention_all_roles:
+        names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
+        return True, (
+            "Ping message sent, but some roles may not have notified because the bot "
+            "cannot mention all roles and cannot temporarily toggle these roles mentionable: "
+            f"{names}. Move the bot role above them and give it Manage Roles, or give the bot Mention Everyone/All Roles."
+        )
+    if blocked_roles and bot_can_mention_all_roles:
+        names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
+        return True, (
+            "Ping message sent using the bot's Mention Everyone/All Roles permission. "
+            "These roles could not be temporarily toggled mentionable, but the channel permission should still allow the ping: "
+            f"{names}."
+        )
+
+    return True, ""
 
 
 def get_ticket_extra_roles(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Role]:
@@ -1630,27 +1718,23 @@ async def get_ticket_category(
     """Return the correct category for normal or priority tickets.
 
     Normal tickets use ticket_category_id. Priority tickets can use
-    priority_ticket_category_id. If the priority category is not configured
-    or was deleted, priority tickets fall back to the normal ticket category
-    instead of failing.
+    priority_ticket_category_id. If no priority category is configured,
+    priority tickets fall back to the normal ticket category so existing
+    setups keep working until an admin runs `/ticketprioritycategory`.
     """
     config = bot.config_store.get_guild(guild.id)
-
+    category_id = 0
     if priority:
         try:
-            priority_category_id = int(config.get("priority_ticket_category_id", 0) or 0)
+            category_id = int(config.get("priority_ticket_category_id", 0) or 0)
         except (TypeError, ValueError):
-            priority_category_id = 0
+            category_id = 0
 
-        if priority_category_id:
-            priority_channel = guild.get_channel(priority_category_id)
-            if isinstance(priority_channel, discord.CategoryChannel):
-                return priority_channel
-
-    try:
-        category_id = int(config.get("ticket_category_id", 0) or 0)
-    except (TypeError, ValueError):
-        category_id = 0
+    if not category_id:
+        try:
+            category_id = int(config.get("ticket_category_id", 0) or 0)
+        except (TypeError, ValueError):
+            category_id = 0
 
     channel = guild.get_channel(category_id)
     return channel if isinstance(channel, discord.CategoryChannel) else None
@@ -2992,7 +3076,7 @@ async def create_ticket_channel(
     category = await get_ticket_category(bot, interaction.guild, priority=priority)
     if category is None:
         if priority:
-            return None, "The configured priority ticket category no longer exists. Run `/ticketprioritycategory` or `/ticketsetup` again."
+            return None, "No valid priority or normal ticket category exists. Run `/ticketsetup` first, then optionally `/ticketprioritycategory`."
         return None, "The configured normal ticket category no longer exists. Run `/ticketsetup` again."
 
     lookup_categories = await get_ticket_lookup_categories(bot, interaction.guild)
@@ -3133,24 +3217,28 @@ async def create_ticket_channel(
                 f"A **{ticket_type.title()}** ticket was opened: {channel.mention}\n"
                 f"**Ticket #:** `{ticket_number}`\n"
                 f"**Opened by:** {interaction.user.mention} (`{interaction.user.id}`)\n\n"
-                "This alert uses the same role-mention pattern as the working **Ping Team** button."
+                "Staff were pinged in the plain role-mention message above this embed."
             ),
             color=ticket_status_color(ticket_type, status="attention"),
         )
-        staff_alert.add_field(name="Ping Roles", value=opening_mentions, inline=False)
         try:
             # Let Discord finish applying private-channel overwrites before the role ping fires.
-            # Newly-created private channels can drop notifications if the mention is sent too fast.
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(0.75)
 
-            # Match the Ping Team button exactly: role mentions in content + embed +
-            # explicit role allowed_mentions. This prevents the mention from being
-            # reduced to plain text while keeping the actual ticket card clean.
-            await channel.send(
-                content=opening_mentions,
+            ping_sent, ping_warning = await send_role_ping_message(
+                channel,
+                ping_roles,
+                content_prefix="📣 New ticket opened:",
                 embed=staff_alert,
-                allowed_mentions=role_allowed_mentions(ping_roles),
+                reason=f"Ticket #{ticket_number} opened staff ping",
             )
+            if ping_warning:
+                await channel.send(f"⚠️ {ping_warning}", allowed_mentions=discord.AllowedMentions.none())
+            if not ping_sent:
+                await channel.send(
+                    "⚠️ Staff role ping failed on ticket open. Use **Ping Team** for now and run `/ticketmentioncheck test_ping:true`.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
         except discord.HTTPException as exc:
             # The ticket itself was created successfully; leave a visible warning
             # instead of silently hiding a broken staff-ping problem.
@@ -3297,11 +3385,16 @@ class AddRoleModal(discord.ui.Modal, title="Add Role To Ticket"):
         overwrite.mention_everyone = True
 
         await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role added to ticket by {interaction.user}")
-        await self.channel.send(
-            f"🔓 {role.mention} can now see this ticket.",
-            allowed_mentions=role_allowed_mentions([role]),
+        ping_sent, ping_warning = await send_role_ping_message(
+            self.channel,
+            [role],
+            content_prefix="🔓 Added to this ticket:",
+            reason=f"Ticket #{get_ticket_number(self.channel)} role added",
         )
-        await interaction.response.send_message(f"Added {role.mention} to this ticket.", ephemeral=True)
+        response = f"Added {role.mention} to this ticket."
+        if ping_warning:
+            response += f"\n\nWarning: {ping_warning}"
+        await interaction.response.send_message(response, ephemeral=True)
 
 
 class RemoveRoleModal(discord.ui.Modal, title="Remove Role From Ticket"):
@@ -3385,11 +3478,16 @@ class SetPingRolesModal(discord.ui.Modal, title="Set Ticket Ping Roles"):
 
         if valid_roles:
             mentions = ", ".join(role.mention for role in valid_roles)
-            await self.channel.send(
-                f"📣 Ticket ping roles updated by {interaction.user.mention}: {mentions}",
-                allowed_mentions=role_allowed_mentions(valid_roles),
+            ping_sent, ping_warning = await send_role_ping_message(
+                self.channel,
+                valid_roles,
+                content_prefix=f"📣 Ticket ping roles updated by {interaction.user.mention}:",
+                reason=f"Ticket #{get_ticket_number(self.channel)} ping roles updated",
             )
-            await interaction.response.send_message(f"Updated ticket ping roles: {mentions}", ephemeral=True)
+            response = f"Updated ticket ping roles: {mentions}"
+            if ping_warning:
+                response += f"\n\nWarning: {ping_warning}"
+            await interaction.response.send_message(response, ephemeral=True)
         else:
             await self.channel.send(f"📣 Ticket ping roles cleared by {interaction.user.mention}.")
             await interaction.response.send_message("Cleared the ticket ping roles.", ephemeral=True)
@@ -3898,12 +3996,20 @@ class TicketChannelView(discord.ui.View):
         )
         ping_embed.add_field(name="Requested By", value=requester_text, inline=False)
         ping_embed.add_field(name="Ping Roles", value=ping_mentions or "None", inline=False)
-        await channel.send(
-            content=ping_mentions,
+        ping_sent, ping_warning = await send_role_ping_message(
+            channel,
+            ping_roles,
+            content_prefix="📣 Staff attention requested:",
             embed=ping_embed,
-            allowed_mentions=role_allowed_mentions(ping_roles),
+            reason=f"Ticket #{get_ticket_number(channel)} Ping Team",
         )
-        await interaction.response.send_message("Pinged the configured ticket roles. This ticket can ping again in 10 minutes.", ephemeral=True)
+        if not ping_sent:
+            await interaction.response.send_message(ping_warning or "I could not send the role ping.", ephemeral=True)
+            return
+        response = "Pinged the configured ticket roles. This ticket can ping again in 10 minutes."
+        if ping_warning:
+            response += f"\n\nWarning: {ping_warning}"
+        await interaction.response.send_message(response, ephemeral=True)
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="ticket:claim", row=0)
     async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -4250,7 +4356,19 @@ def format_permission_flag(value: Optional[bool]) -> str:
 def roles_with_positions(roles: list[discord.Role]) -> str:
     if not roles:
         return "None"
-    return "\n".join(f"{role.mention} (`{role.id}`) — position `{role.position}`" for role in roles)
+    lines: list[str] = []
+    for role in roles:
+        guild = role.guild
+        me = guild.me
+        above_text = "unknown"
+        if me is not None:
+            above_text = "yes" if me.top_role > role else "no"
+        toggle_text = "yes" if bot_can_manage_role(guild, role) else "no"
+        lines.append(
+            f"{role.mention} (`{role.id}`) — position `{role.position}` | "
+            f"mentionable: `{str(role.mentionable).lower()}` | bot above: `{above_text}` | temp-toggle: `{toggle_text}`"
+        )
+    return "\n".join(lines)
 
 class TicketCommands(commands.Cog):
     def __init__(self, bot: "TicketBot"):
@@ -4708,10 +4826,16 @@ class TicketCommands(commands.Cog):
 
         if test_ping and test_roles and channel is not None:
             await interaction.response.send_message(embed=embed, ephemeral=True)
-            await channel.send(
-                content=f"📣 Ticket mention test: {mention_roles(test_roles)}",
-                allowed_mentions=role_allowed_mentions(test_roles),
+            ping_sent, ping_warning = await send_role_ping_message(
+                channel,
+                test_roles,
+                content_prefix="📣 Ticket mention test:",
+                reason="Ticket mention check test ping",
             )
+            if ping_warning:
+                await interaction.followup.send(f"Warning: {ping_warning}", ephemeral=True)
+            elif not ping_sent:
+                await interaction.followup.send(ping_warning or "The test ping failed.", ephemeral=True)
             return
 
         if test_ping and not test_roles:
