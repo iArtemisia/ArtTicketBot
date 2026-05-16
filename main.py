@@ -1158,6 +1158,14 @@ def get_priority_ping_roles(bot: "TicketBot", guild: discord.Guild) -> list[disc
 def member_can_open_priority(bot: "TicketBot", member: discord.Member) -> bool:
     if member.guild_permissions.administrator or member.guild_permissions.manage_channels:
         return True
+
+    # Ticket staff should always be able to open/test priority tickets even if
+    # they do not have Manage Channels. This prevents priority tickets from
+    # appearing broken for admins whose authority comes from configured staff
+    # roles rather than Discord's channel-management permission.
+    if member_is_staff(bot, member):
+        return True
+
     allowed_role_ids = set(get_role_ids_from_config(bot, member.guild.id, "priority_allowed"))
     member_role_ids = {role.id for role in member.roles}
     return bool(allowed_role_ids & member_role_ids)
@@ -1190,8 +1198,16 @@ def unique_roles(*role_lists: list[discord.Role]) -> list[discord.Role]:
 
 
 def role_allowed_mentions(roles: list[discord.Role]) -> discord.AllowedMentions:
-    """Allow exactly these role mentions to parse for ticket alerts."""
-    return discord.AllowedMentions(everyone=False, users=False, roles=roles)
+    """Allow role mentions in messages that only contain vetted ticket roles.
+
+    The caller still controls the actual content, so this does not ping random
+    roles unless they were placed in the message content by the bot. Using
+    roles=True is more reliable across discord.py versions than passing Role
+    objects, and it matches the behavior needed for non-mentionable staff roles
+    when the bot has the Discord "Mention @everyone, @here, and All Roles"
+    permission.
+    """
+    return discord.AllowedMentions(everyone=False, users=False, roles=True)
 
 
 def get_ticket_extra_roles(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Role]:
@@ -1614,23 +1630,27 @@ async def get_ticket_category(
     """Return the correct category for normal or priority tickets.
 
     Normal tickets use ticket_category_id. Priority tickets can use
-    priority_ticket_category_id. If no priority category is configured,
-    priority tickets fall back to the normal ticket category so existing
-    setups keep working until an admin runs `/ticketprioritycategory`.
+    priority_ticket_category_id. If the priority category is not configured
+    or was deleted, priority tickets fall back to the normal ticket category
+    instead of failing.
     """
     config = bot.config_store.get_guild(guild.id)
-    category_id = 0
+
     if priority:
         try:
-            category_id = int(config.get("priority_ticket_category_id", 0) or 0)
+            priority_category_id = int(config.get("priority_ticket_category_id", 0) or 0)
         except (TypeError, ValueError):
-            category_id = 0
+            priority_category_id = 0
 
-    if not category_id:
-        try:
-            category_id = int(config.get("ticket_category_id", 0) or 0)
-        except (TypeError, ValueError):
-            category_id = 0
+        if priority_category_id:
+            priority_channel = guild.get_channel(priority_category_id)
+            if isinstance(priority_channel, discord.CategoryChannel):
+                return priority_channel
+
+    try:
+        category_id = int(config.get("ticket_category_id", 0) or 0)
+    except (TypeError, ValueError):
+        category_id = 0
 
     channel = guild.get_channel(category_id)
     return channel if isinstance(channel, discord.CategoryChannel) else None
@@ -3113,28 +3133,34 @@ async def create_ticket_channel(
                 f"A **{ticket_type.title()}** ticket was opened: {channel.mention}\n"
                 f"**Ticket #:** `{ticket_number}`\n"
                 f"**Opened by:** {interaction.user.mention} (`{interaction.user.id}`)\n\n"
-                "Staff were pinged in the plain role-mention message above this embed."
+                "This alert uses the same role-mention pattern as the working **Ping Team** button."
             ),
             color=ticket_status_color(ticket_type, status="attention"),
         )
+        staff_alert.add_field(name="Ping Roles", value=opening_mentions, inline=False)
         try:
             # Let Discord finish applying private-channel overwrites before the role ping fires.
-            await asyncio.sleep(0.75)
+            # Newly-created private channels can drop notifications if the mention is sent too fast.
+            await asyncio.sleep(3.0)
 
-            # Send the role mention as its own plain message. This mirrors the working
-            # Ping Team button instead of hiding the mention inside the starter card/embed.
+            # Match the Ping Team button exactly: role mentions in content + embed +
+            # explicit role allowed_mentions. This prevents the mention from being
+            # reduced to plain text while keeping the actual ticket card clean.
             await channel.send(
-                content=f"📣 New ticket opened: {opening_mentions}",
+                content=opening_mentions,
+                embed=staff_alert,
                 allowed_mentions=role_allowed_mentions(ping_roles),
             )
-            await channel.send(
-                embed=staff_alert,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            # The ticket itself was created successfully; do not fail the whole flow
-            # just because the staff alert could not be sent. Staff can still use Ping Team.
-            pass
+        except discord.HTTPException as exc:
+            # The ticket itself was created successfully; leave a visible warning
+            # instead of silently hiding a broken staff-ping problem.
+            try:
+                await channel.send(
+                    f"⚠️ Staff role ping failed on ticket open. Use **Ping Team** for now. Error: `{truncate(str(exc), 300)}`",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                pass
 
     bot.stats_store.record_open(
         guild.id,
