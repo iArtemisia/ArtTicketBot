@@ -43,6 +43,9 @@ TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
 TICKET_STATS_PATH = Path(os.getenv("TICKET_STATS_PATH", str(CONFIG_PATH.parent / "ticket_stats.json")))
 TICKET_PING_COOLDOWN_SECONDS = 10 * 60
 TICKET_TEMP_ENABLE_ROLE_MENTIONS = os.getenv("TICKET_TEMP_ENABLE_ROLE_MENTIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
+TICKET_USER_MENTION_FALLBACK = os.getenv("TICKET_USER_MENTION_FALLBACK", "true").strip().lower() not in {"0", "false", "no", "off"}
+TICKET_HERE_FALLBACK = os.getenv("TICKET_HERE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 TICKET_CONFIG: dict[str, str] = {
     "label": "Open Ticket",
@@ -1157,11 +1160,21 @@ def get_priority_ping_roles(bot: "TicketBot", guild: discord.Guild) -> list[disc
 
 
 def member_can_open_priority(bot: "TicketBot", member: discord.Member) -> bool:
+    """Return whether this member can open priority tickets.
+
+    Staff should always be able to open/test priority tickets. Earlier patches
+    only allowed server managers or configured priority-opener roles, which made
+    priority ticket testing look broken for staff.
+    """
     if member.guild_permissions.administrator or member.guild_permissions.manage_channels:
         return True
+    if member_is_staff(bot, member):
+        return True
+
     allowed_role_ids = set(get_role_ids_from_config(bot, member.guild.id, "priority_allowed"))
+    priority_staff_ids = set(get_role_ids_from_config(bot, member.guild.id, "priority_staff"))
     member_role_ids = {role.id for role in member.roles}
-    return bool(allowed_role_ids & member_role_ids)
+    return bool((allowed_role_ids | priority_staff_ids) & member_role_ids)
 
 
 def get_ticket_ping_roles(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Role]:
@@ -1208,6 +1221,47 @@ def bot_can_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
     return bool(me.guild_permissions.manage_roles and me.top_role > role)
 
 
+def members_for_roles(roles: list[discord.Role]) -> list[discord.Member]:
+    """Return cached members that have any of the given roles.
+
+    This is used only as a fallback when Discord renders a role mention but
+    does not actually notify it. It works best when the bot has the Server
+    Members intent enabled; otherwise Discord may only expose members already
+    in cache.
+    """
+    target_role_ids = {role.id for role in roles if role is not None}
+    if not target_role_ids:
+        return []
+
+    result: list[discord.Member] = []
+    seen: set[int] = set()
+    for role in roles:
+        for member in getattr(role, "members", []):
+            if member.bot or member.id in seen:
+                continue
+            member_role_ids = {member_role.id for member_role in getattr(member, "roles", [])}
+            if target_role_ids & member_role_ids:
+                seen.add(member.id)
+                result.append(member)
+    return result
+
+
+def build_member_mention_chunks(members: list[discord.Member], *, prefix: str, limit: int = 1850) -> list[str]:
+    chunks: list[str] = []
+    current = prefix.strip()
+    for member in members:
+        mention = member.mention
+        candidate = f"{current} {mention}".strip() if current else mention
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = f"{prefix.strip()} {mention}".strip() if prefix else mention
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def send_role_ping_message(
     channel: discord.TextChannel,
     roles: list[discord.Role],
@@ -1243,7 +1297,14 @@ async def send_role_ping_message(
     # role mention closes that gap when the bot has Manage Roles and hierarchy.
     bot_member = channel.guild.me
     channel_perms = channel.permissions_for(bot_member) if bot_member is not None else None
-    bot_can_mention_all_roles = bool(getattr(channel_perms, "mention_everyone", False))
+    # Do not rely only on a private-channel overwrite. In practice Discord can
+    # render a role mention while still not notifying it unless the bot has the
+    # actual server permission or the role is mentionable.
+    bot_can_mention_all_roles = bool(
+        bot_member is not None
+        and getattr(bot_member.guild_permissions, "mention_everyone", False)
+        and getattr(channel_perms, "mention_everyone", False)
+    )
 
     if TICKET_TEMP_ENABLE_ROLE_MENTIONS:
         for role in ping_roles:
@@ -1262,12 +1323,32 @@ async def send_role_ping_message(
         if toggled:
             await asyncio.sleep(0.35)
 
+    user_fallback_members = members_for_roles(ping_roles) if TICKET_USER_MENTION_FALLBACK else []
+
     try:
         await channel.send(
             content=content,
             embed=embed,
             allowed_mentions=role_allowed_mentions(ping_roles),
         )
+
+        # Hard fallback: Discord can show a green role mention without sending
+        # notifications when the role is not mentionable or the bot cannot truly
+        # mention all roles. Direct user mentions are the reliable backup.
+        if user_fallback_members:
+            for chunk in build_member_mention_chunks(
+                user_fallback_members,
+                prefix="🔔 Staff direct alert fallback:",
+            ):
+                await channel.send(
+                    content=chunk,
+                    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+                )
+        elif TICKET_HERE_FALLBACK and (blocked_roles or not bot_can_mention_all_roles):
+            await channel.send(
+                content="🔔 Staff alert fallback: @here",
+                allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False),
+            )
     except discord.Forbidden as exc:
         return False, f"I do not have permission to send the role ping in {channel.mention}: `{truncate(str(exc), 250)}`"
     except discord.HTTPException as exc:
@@ -1280,19 +1361,19 @@ async def send_role_ping_message(
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-    if blocked_roles and not bot_can_mention_all_roles:
+    if blocked_roles and user_fallback_members:
         names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
         return True, (
-            "Ping message sent, but some roles may not have notified because the bot "
-            "cannot mention all roles and cannot temporarily toggle these roles mentionable: "
-            f"{names}. Move the bot role above them and give it Manage Roles, or give the bot Mention Everyone/All Roles."
+            "Role mention was sent, but these roles could not be temporarily toggled mentionable: "
+            f"{names}. I also sent direct staff-user mentions as the fallback notification."
         )
-    if blocked_roles and bot_can_mention_all_roles:
+
+    if blocked_roles and not user_fallback_members:
         names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
         return True, (
-            "Ping message sent using the bot's Mention Everyone/All Roles permission. "
-            "These roles could not be temporarily toggled mentionable, but the channel permission should still allow the ping: "
-            f"{names}."
+            "Role mention was sent, but Discord may not notify because the bot cannot toggle these roles mentionable: "
+            f"{names}. Move the bot role above them and give it Manage Roles, or enable Server Members Intent "
+            "so I can directly mention staff members as a fallback."
         )
 
     return True, ""
@@ -3223,7 +3304,7 @@ async def create_ticket_channel(
         )
         try:
             # Let Discord finish applying private-channel overwrites before the role ping fires.
-            await asyncio.sleep(0.75)
+            await asyncio.sleep(3.0)
 
             ping_sent, ping_warning = await send_role_ping_message(
                 channel,
@@ -5282,6 +5363,7 @@ class TicketBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.guilds = True
+        intents.members = ENABLE_MEMBERS_INTENT
         intents.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 
         super().__init__(command_prefix="!", intents=intents)
