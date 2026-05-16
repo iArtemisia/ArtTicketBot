@@ -1263,7 +1263,10 @@ def get_selectable_roles(
     # Staff Filter only narrows staff-facing ticket dropdowns.
     # Priority Opener is intentionally NOT filtered to staff roles because
     # it is meant for player/customer roles like VIP, Donator, Premium, etc.
-    staff_filtered_targets = {"normal_staff", "normal_ping", "priority_staff", "priority_ping"}
+    # Staff Filter only applies to access roles. Ping roles must be selectable
+    # from any server role because servers may ping non-staff helper/support
+    # roles that should not appear in the access-role dropdown.
+    staff_filtered_targets = {"normal_staff", "priority_staff"}
 
     if action == "add":
         if normalized_target in staff_filtered_targets:
@@ -1356,9 +1359,12 @@ def build_role_config_embed(
         if action == "add"
         else f"Dropdown shows roles that are currently configured as {target_info['description']}."
     )
-    if normalized_target in {"normal_staff", "normal_ping", "priority_staff", "priority_ping"} and action == "add" and staff_filter_roles:
+    if normalized_target in {"normal_staff", "priority_staff"} and action == "add" and staff_filter_roles:
         helper += "\
 This list is filtered to your configured staff-filter roles."
+    elif normalized_target in {"normal_ping", "priority_ping"} and action == "add":
+        helper += "\
+Ping roles are not limited by the staff filter, so any non-managed server role can be selected."
     elif normalized_target == "priority_allowed" and action == "add":
         helper += "\
 Priority Opener is intentionally not filtered to staff roles."
@@ -1528,7 +1534,10 @@ def build_admin_panel_embed(bot: "TicketBot", guild: discord.Guild, channel: Opt
         )
         embed.add_field(
             name="Ticket-specific tools",
-            value="Ticket-specific role/ping overrides are removed. Use normal/priority default settings above.",
+            value=(
+                "Use the buttons below to add/remove roles from this ticket or change this ticket's ping roles.\n"
+                "These ticket-specific tools are separate from the default normal/priority settings above."
+            ),
             inline=False,
         )
     else:
@@ -3012,6 +3021,7 @@ async def create_ticket_channel(
             manage_threads=True,
             create_private_threads=True,
             send_messages_in_threads=True,
+            mention_everyone=True,
             embed_links=True,
             attach_files=True,
         )
@@ -3031,6 +3041,7 @@ async def create_ticket_channel(
             manage_threads=True,
             create_private_threads=True,
             send_messages_in_threads=True,
+            mention_everyone=True,
             attach_files=True,
             embed_links=True,
         )
@@ -3113,7 +3124,7 @@ async def create_ticket_channel(
             # Send the role mention as its own plain message. This mirrors the working
             # Ping Team button instead of hiding the mention inside the starter card/embed.
             await channel.send(
-                content=opening_mentions,
+                content=f"📣 New ticket opened: {opening_mentions}",
                 allowed_mentions=role_allowed_mentions(ping_roles),
             )
             await channel.send(
@@ -3257,9 +3268,13 @@ class AddRoleModal(discord.ui.Modal, title="Add Role To Ticket"):
         overwrite.read_message_history = True
         overwrite.attach_files = True
         overwrite.embed_links = True
+        overwrite.mention_everyone = True
 
         await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role added to ticket by {interaction.user}")
-        await self.channel.send(f"🔓 {role.mention} can now see this ticket.")
+        await self.channel.send(
+            f"🔓 {role.mention} can now see this ticket.",
+            allowed_mentions=role_allowed_mentions([role]),
+        )
         await interaction.response.send_message(f"Added {role.mention} to this ticket.", ephemeral=True)
 
 
@@ -3344,7 +3359,10 @@ class SetPingRolesModal(discord.ui.Modal, title="Set Ticket Ping Roles"):
 
         if valid_roles:
             mentions = ", ".join(role.mention for role in valid_roles)
-            await self.channel.send(f"📣 Ticket ping roles updated by {interaction.user.mention}: {mentions}")
+            await self.channel.send(
+                f"📣 Ticket ping roles updated by {interaction.user.mention}: {mentions}",
+                allowed_mentions=role_allowed_mentions(valid_roles),
+            )
             await interaction.response.send_message(f"Updated ticket ping roles: {mentions}", ephemeral=True)
         else:
             await self.channel.send(f"📣 Ticket ping roles cleared by {interaction.user.mention}.")
@@ -4160,6 +4178,30 @@ class TicketAdminPanelView(discord.ui.View):
         await send_role_config_panel(interaction, self.bot, "priority_allowed", "remove")
 
 
+    @discord.ui.button(label="Add Ticket Role", style=discord.ButtonStyle.success, row=4)
+    async def add_ticket_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        ticket_channel = self._get_ticket_channel(interaction)
+        if ticket_channel is None:
+            await interaction.response.send_message("Open `/ticketadmin` inside a ticket channel to add a role to that ticket.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddRoleModal(self.bot, ticket_channel))
+
+    @discord.ui.button(label="Remove Ticket Role", style=discord.ButtonStyle.danger, row=4)
+    async def remove_ticket_role_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        ticket_channel = self._get_ticket_channel(interaction)
+        if ticket_channel is None:
+            await interaction.response.send_message("Open `/ticketadmin` inside a ticket channel to remove a role from that ticket.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RemoveRoleModal(self.bot, ticket_channel))
+
+    @discord.ui.button(label="Set Ticket Ping", style=discord.ButtonStyle.secondary, row=4)
+    async def set_ticket_ping_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        ticket_channel = self._get_ticket_channel(interaction)
+        if ticket_channel is None:
+            await interaction.response.send_message("Open `/ticketadmin` inside a ticket channel to set that ticket's ping roles.", ephemeral=True)
+            return
+        await interaction.response.send_modal(SetPingRolesModal(self.bot, ticket_channel))
+
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=4)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None:
@@ -4168,6 +4210,21 @@ class TicketAdminPanelView(discord.ui.View):
 
         embed = build_admin_panel_embed(self.bot, interaction.guild, interaction.channel)
         await interaction.response.edit_message(embed=embed, view=self)
+
+
+
+def format_permission_flag(value: Optional[bool]) -> str:
+    if value is True:
+        return "✅ yes"
+    if value is False:
+        return "❌ no"
+    return "➖ inherited"
+
+
+def roles_with_positions(roles: list[discord.Role]) -> str:
+    if not roles:
+        return "None"
+    return "\n".join(f"{role.mention} (`{role.id}`) — position `{role.position}`" for role in roles)
 
 class TicketCommands(commands.Cog):
     def __init__(self, bot: "TicketBot"):
@@ -4554,6 +4611,87 @@ class TicketCommands(commands.Cog):
             f"{legacy_notice}",
             ephemeral=True,
         )
+
+
+    @app_commands.command(name="ticketmentioncheck", description="Check ticket ping roles, mention permissions, and optionally send a test ping.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(test_ping="Send a real test ping to the configured ticket ping roles in this channel.")
+    async def ticket_mention_check(self, interaction: discord.Interaction, test_ping: bool = False) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+        config = self.bot.config_store.get_guild(guild.id)
+
+        normal_access = get_staff_roles(self.bot, guild)
+        normal_ping = get_guild_ping_roles(self.bot, guild)
+        priority_access = get_priority_staff_roles(self.bot, guild)
+        priority_ping = get_priority_ping_roles(self.bot, guild)
+
+        bot_member = guild.me
+        bot_guild_perms = bot_member.guild_permissions if bot_member is not None else None
+        bot_channel_perms = channel.permissions_for(bot_member) if channel is not None and bot_member is not None else None
+
+        embed = discord.Embed(
+            title="Ticket Mention Check",
+            description=(
+                "Use this to verify whether the bot has configured real ping roles and whether Discord permissions allow role mentions.\n"
+                "If this shows roles but test ping still does not notify, check the bot role hierarchy and the role's mentionability setting in Discord."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="Normal access roles", value=truncate(roles_with_positions(normal_access), 1024), inline=False)
+        embed.add_field(name="Normal ping roles", value=truncate(roles_with_positions(normal_ping), 1024), inline=False)
+        embed.add_field(name="Priority access roles", value=truncate(roles_with_positions(priority_access), 1024), inline=False)
+        embed.add_field(name="Priority ping roles", value=truncate(roles_with_positions(priority_ping), 1024), inline=False)
+
+        perm_lines = [
+            f"Bot role position: `{bot_member.top_role.position if bot_member else 'unknown'}`",
+            f"Guild Manage Channels: {format_permission_flag(getattr(bot_guild_perms, 'manage_channels', None))}",
+            f"Guild Mention Everyone/Roles: {format_permission_flag(getattr(bot_guild_perms, 'mention_everyone', None))}",
+        ]
+        if channel is not None:
+            perm_lines.extend([
+                f"Channel: {channel.mention}",
+                f"Channel Send Messages: {format_permission_flag(getattr(bot_channel_perms, 'send_messages', None))}",
+                f"Channel Mention Everyone/Roles: {format_permission_flag(getattr(bot_channel_perms, 'mention_everyone', None))}",
+            ])
+        embed.add_field(name="Bot permissions", value="\n".join(perm_lines), inline=False)
+
+        configured_ids = [
+            *(int(value) for value in config.get("ping_role_ids", []) if str(value).isdigit()),
+            *(int(value) for value in config.get("priority_ping_role_ids", []) if str(value).isdigit()),
+        ]
+        missing_ids = [role_id for role_id in configured_ids if guild.get_role(role_id) is None]
+        embed.add_field(
+            name="Stored config IDs",
+            value=(
+                f"Normal ping IDs: `{config.get('ping_role_ids', [])}`\n"
+                f"Priority ping IDs: `{config.get('priority_ping_role_ids', [])}`\n"
+                f"Missing role IDs: `{missing_ids or []}`"
+            ),
+            inline=False,
+        )
+
+        test_roles = unique_roles(normal_ping, priority_ping)
+        if not test_roles:
+            test_roles = unique_roles(normal_access, priority_access)
+
+        if test_ping and test_roles and channel is not None:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await channel.send(
+                content=f"📣 Ticket mention test: {mention_roles(test_roles)}",
+                allowed_mentions=role_allowed_mentions(test_roles),
+            )
+            return
+
+        if test_ping and not test_roles:
+            embed.add_field(name="Test ping", value="No ping/access roles are configured to test.", inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="ticketadmin", description="Open the ticket admin control panel.")
     @app_commands.default_permissions(manage_guild=True)
