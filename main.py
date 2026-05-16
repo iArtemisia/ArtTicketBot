@@ -43,7 +43,9 @@ TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
 TICKET_STATS_PATH = Path(os.getenv("TICKET_STATS_PATH", str(CONFIG_PATH.parent / "ticket_stats.json")))
 TICKET_PING_COOLDOWN_SECONDS = 10 * 60
 TICKET_TEMP_ENABLE_ROLE_MENTIONS = os.getenv("TICKET_TEMP_ENABLE_ROLE_MENTIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
-TICKET_USER_MENTION_FALLBACK = os.getenv("TICKET_USER_MENTION_FALLBACK", "true").strip().lower() not in {"0", "false", "no", "off"}
+# Keep direct staff-user mentions OFF by default. Role pings should stay role-only;
+# set TICKET_USER_MENTION_FALLBACK=true only if you intentionally want user @ spam.
+TICKET_USER_MENTION_FALLBACK = os.getenv("TICKET_USER_MENTION_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 TICKET_HERE_FALLBACK = os.getenv("TICKET_HERE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -1224,10 +1226,8 @@ def bot_can_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
 def members_for_roles(roles: list[discord.Role]) -> list[discord.Member]:
     """Return cached members that have any of the given roles.
 
-    This is used only as a fallback when Discord renders a role mention but
-    does not actually notify it. It works best when the bot has the Server
-    Members intent enabled; otherwise Discord may only expose members already
-    in cache.
+    This is used only if TICKET_USER_MENTION_FALLBACK=true. It is disabled
+    by default because it can spam individual staff members.
     """
     target_role_ids = {role.id for role in roles if role is not None}
     if not target_role_ids:
@@ -1332,10 +1332,10 @@ async def send_role_ping_message(
             allowed_mentions=role_allowed_mentions(ping_roles),
         )
 
-        # Hard fallback: Discord can show a green role mention without sending
+        # Optional fallback: Discord can show a green role mention without sending
         # notifications when the role is not mentionable or the bot cannot truly
-        # mention all roles. Direct user mentions are the reliable backup.
-        if user_fallback_members:
+        # mention all roles. This is OFF by default to avoid user @ spam.
+        if TICKET_USER_MENTION_FALLBACK and user_fallback_members:
             for chunk in build_member_mention_chunks(
                 user_fallback_members,
                 prefix="🔔 Staff direct alert fallback:",
@@ -1361,19 +1361,19 @@ async def send_role_ping_message(
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-    if blocked_roles and user_fallback_members:
+    if blocked_roles and TICKET_USER_MENTION_FALLBACK and user_fallback_members:
         names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
         return True, (
             "Role mention was sent, but these roles could not be temporarily toggled mentionable: "
-            f"{names}. I also sent direct staff-user mentions as the fallback notification."
+            f"{names}. Direct staff-user fallback was enabled, so individual staff members were also mentioned."
         )
 
     if blocked_roles and not user_fallback_members:
         names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
         return True, (
             "Role mention was sent, but Discord may not notify because the bot cannot toggle these roles mentionable: "
-            f"{names}. Move the bot role above them and give it Manage Roles, or enable Server Members Intent "
-            "so I can directly mention staff members as a fallback."
+            f"{names}. Check the bot role has Manage Roles and is above the role, or manually make the role mentionable. "
+            "Direct staff-user fallback is disabled by default to avoid user @ spam."
         )
 
     return True, ""
