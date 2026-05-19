@@ -42,7 +42,9 @@ DEFAULT_PANEL_GIF_URL = os.getenv("PANEL_GIF_URL", "").strip()
 TICKET_LOG_DIR = CONFIG_PATH.parent / "ticket_logs"
 TICKET_STATS_PATH = Path(os.getenv("TICKET_STATS_PATH", str(CONFIG_PATH.parent / "ticket_stats.json")))
 TICKET_PING_COOLDOWN_SECONDS = 10 * 60
-TICKET_TEMP_ENABLE_ROLE_MENTIONS = os.getenv("TICKET_TEMP_ENABLE_ROLE_MENTIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
+# Role mentionability toggling is disabled. The bot should not flip staff roles
+# mentionable on/off because that spams Discord audit/mod logs.
+TICKET_TEMP_ENABLE_ROLE_MENTIONS = False
 # Keep direct staff-user mentions OFF by default. Role pings should stay role-only;
 # set TICKET_USER_MENTION_FALLBACK=true only if you intentionally want user @ spam.
 TICKET_USER_MENTION_FALLBACK = os.getenv("TICKET_USER_MENTION_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -1270,16 +1272,15 @@ async def send_role_ping_message(
     embed: Optional[discord.Embed] = None,
     reason: str = "Ticket role ping",
 ) -> tuple[bool, str]:
-    """Send a role ping in the most reliable way this bot can.
+    """Send a role ping without editing/toggling any Discord roles.
 
-    Discord will only notify a role mention when either:
-    - the sender has Mention Everyone/All Roles permission, or
-    - the target role is currently mentionable.
+    This intentionally does NOT call role.edit(mentionable=True/False).
+    The bot will only send the configured role mention and let Discord handle
+    notification based on normal permissions:
+    - the bot has Mention @everyone, @here, and All Roles permission, or
+    - the target role is already mentionable.
 
-    Some servers keep staff roles non-mentionable, so this briefly toggles the
-    target roles mentionable while the bot sends the alert, then restores them.
-    If the bot cannot manage a role, the message is still sent and a warning is
-    returned so admins know what permission/hierarchy is blocking true pings.
+    This avoids audit-log spam from repeatedly switching staff roles mentionable.
     """
     ping_roles = unique_roles(roles)
     if not ping_roles:
@@ -1289,40 +1290,14 @@ async def send_role_ping_message(
     clean_prefix = str(content_prefix or "").strip()
     content = f"{clean_prefix} {mentions}".strip() if clean_prefix else mentions
 
-    toggled: list[tuple[discord.Role, bool]] = []
-    blocked_roles: list[discord.Role] = []
-
-    # If the bot lacks Mention Everyone/All Roles in this channel, non-mentionable
-    # roles will render but will not actually notify. Temporarily enabling the
-    # role mention closes that gap when the bot has Manage Roles and hierarchy.
     bot_member = channel.guild.me
     channel_perms = channel.permissions_for(bot_member) if bot_member is not None else None
-    # Do not rely only on a private-channel overwrite. In practice Discord can
-    # render a role mention while still not notifying it unless the bot has the
-    # actual server permission or the role is mentionable.
     bot_can_mention_all_roles = bool(
         bot_member is not None
         and getattr(bot_member.guild_permissions, "mention_everyone", False)
         and getattr(channel_perms, "mention_everyone", False)
     )
-
-    if TICKET_TEMP_ENABLE_ROLE_MENTIONS:
-        for role in ping_roles:
-            if role.mentionable:
-                continue
-            if not bot_can_manage_role(channel.guild, role):
-                blocked_roles.append(role)
-                continue
-            try:
-                original = bool(role.mentionable)
-                await role.edit(mentionable=True, reason=reason)
-                toggled.append((role, original))
-            except (discord.Forbidden, discord.HTTPException):
-                blocked_roles.append(role)
-
-        if toggled:
-            await asyncio.sleep(0.35)
-
+    blocked_roles = [role for role in ping_roles if not role.mentionable and not bot_can_mention_all_roles]
     user_fallback_members = members_for_roles(ping_roles) if TICKET_USER_MENTION_FALLBACK else []
 
     try:
@@ -1332,9 +1307,8 @@ async def send_role_ping_message(
             allowed_mentions=role_allowed_mentions(ping_roles),
         )
 
-        # Optional fallback: Discord can show a green role mention without sending
-        # notifications when the role is not mentionable or the bot cannot truly
-        # mention all roles. This is OFF by default to avoid user @ spam.
+        # Optional fallback is still off by default. It exists only if you
+        # intentionally enable it with TICKET_USER_MENTION_FALLBACK=true.
         if TICKET_USER_MENTION_FALLBACK and user_fallback_members:
             for chunk in build_member_mention_chunks(
                 user_fallback_members,
@@ -1344,7 +1318,7 @@ async def send_role_ping_message(
                     content=chunk,
                     allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
                 )
-        elif TICKET_HERE_FALLBACK and (blocked_roles or not bot_can_mention_all_roles):
+        elif TICKET_HERE_FALLBACK and blocked_roles:
             await channel.send(
                 content="🔔 Staff alert fallback: @here",
                 allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False),
@@ -1353,27 +1327,20 @@ async def send_role_ping_message(
         return False, f"I do not have permission to send the role ping in {channel.mention}: `{truncate(str(exc), 250)}`"
     except discord.HTTPException as exc:
         return False, f"Discord rejected the role ping message: `{truncate(str(exc), 250)}`"
-    finally:
-        # Restore role mentionability even if the send fails.
-        for role, original in toggled:
-            try:
-                await role.edit(mentionable=original, reason=f"{reason} restore")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
 
     if blocked_roles and TICKET_USER_MENTION_FALLBACK and user_fallback_members:
         names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
         return True, (
-            "Role mention was sent, but these roles could not be temporarily toggled mentionable: "
-            f"{names}. Direct staff-user fallback was enabled, so individual staff members were also mentioned."
+            "Role mention was sent, but Discord may not notify these non-mentionable roles without the bot's "
+            f"Mention All Roles permission: {names}. Direct staff-user fallback was enabled, so individual staff members were also mentioned."
         )
 
-    if blocked_roles and not user_fallback_members:
+    if blocked_roles:
         names = ", ".join(f"{role.name} (`{role.id}`)" for role in blocked_roles[:8])
         return True, (
-            "Role mention was sent, but Discord may not notify because the bot cannot toggle these roles mentionable: "
-            f"{names}. Check the bot role has Manage Roles and is above the role, or manually make the role mentionable. "
-            "Direct staff-user fallback is disabled by default to avoid user @ spam."
+            "Role mention was sent without editing any role settings. Discord may not notify these roles unless the bot has "
+            "Mention @everyone/@here/All Roles permission in this channel, or the role is manually mentionable: "
+            f"{names}."
         )
 
     return True, ""
@@ -4444,10 +4411,10 @@ def roles_with_positions(roles: list[discord.Role]) -> str:
         above_text = "unknown"
         if me is not None:
             above_text = "yes" if me.top_role > role else "no"
-        toggle_text = "yes" if bot_can_manage_role(guild, role) else "no"
+        can_manage_text = "yes" if bot_can_manage_role(guild, role) else "no"
         lines.append(
             f"{role.mention} (`{role.id}`) — position `{role.position}` | "
-            f"mentionable: `{str(role.mentionable).lower()}` | bot above: `{above_text}` | temp-toggle: `{toggle_text}`"
+            f"mentionable: `{str(role.mentionable).lower()}` | bot above: `{above_text}` | bot can manage role: `{can_manage_text}` | temp-toggle: `disabled`"
         )
     return "\n".join(lines)
 
