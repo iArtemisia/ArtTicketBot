@@ -3042,6 +3042,102 @@ async def ensure_notes_participant(notes_channel, member: discord.Member) -> Non
             pass
 
 
+async def remove_notes_participant(notes_channel, member: discord.Member) -> None:
+    """Remove a member from a private staff-notes thread when ticket access is removed."""
+    if isinstance(notes_channel, discord.Thread):
+        try:
+            await notes_channel.remove_user(member)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+def cached_ticket_staff_members_for_notes(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    ticket_channel: discord.TextChannel,
+    *,
+    extra_members: Optional[list[discord.Member]] = None,
+) -> list[discord.Member]:
+    """Return cached staff members that should be added to this ticket's notes thread.
+
+    Private Discord threads do not inherit role membership the same way the
+    parent ticket channel does. If only the staff member who runs /notes is
+    added, every other staff member has to run /notes before they can see the
+    thread. This helper adds the ticket's staff automatically while keeping the
+    ticket owner/player out of staff notes.
+    """
+    owner_id = get_ticket_owner_id(ticket_channel) or 0
+    bot_id = int(getattr(getattr(guild, "me", None), "id", 0) or 0)
+    configured_staff_role_ids = set(get_role_ids_from_config(bot, guild.id, "normal_staff")) | set(get_role_ids_from_config(bot, guild.id, "priority_staff"))
+    members: list[discord.Member] = []
+    seen: set[int] = set()
+
+    def add_member(member: Optional[discord.Member]) -> None:
+        if member is None:
+            return
+        if member.bot or member.id in {owner_id, bot_id} or member.id in seen:
+            return
+        member_role_ids = {role.id for role in getattr(member, "roles", [])}
+        # Staff notes should stay staff-only. A user/role may be added to the
+        # public ticket without being allowed into internal notes.
+        if not (
+            (configured_staff_role_ids & member_role_ids)
+            or member.guild_permissions.manage_channels
+            or member.guild_permissions.administrator
+        ):
+            return
+        seen.add(member.id)
+        members.append(member)
+
+    for member in extra_members or []:
+        add_member(member)
+
+    # Add cached members from every role that can see this ticket. This covers
+    # normal staff, priority staff, and ticket-specific role overwrites. Full
+    # coverage requires Discord's Server Members Intent; without it, Discord may
+    # only expose members that are already cached.
+    for target, overwrite in ticket_channel.overwrites.items():
+        if isinstance(target, discord.Role) and not target.is_default() and overwrite.view_channel is True:
+            for member in getattr(target, "members", []):
+                add_member(member)
+        elif isinstance(target, discord.Member) and overwrite.view_channel is True:
+            add_member(target)
+
+    # Also include configured staff roles, even if Discord is inheriting their
+    # ticket access from a category instead of a direct channel overwrite.
+    for role in unique_roles(get_staff_roles(bot, guild), get_priority_staff_roles(bot, guild)):
+        for member in getattr(role, "members", []):
+            add_member(member)
+
+    return members
+
+
+async def sync_notes_thread_staff(
+    bot: "TicketBot",
+    ticket_channel: discord.TextChannel,
+    notes_thread: Optional[discord.Thread],
+    *,
+    extra_members: Optional[list[discord.Member]] = None,
+) -> int:
+    """Add all currently known ticket staff to the ticket's private notes thread."""
+    if notes_thread is None or not isinstance(notes_thread, discord.Thread):
+        return 0
+
+    staff_members = cached_ticket_staff_members_for_notes(
+        bot,
+        ticket_channel.guild,
+        ticket_channel,
+        extra_members=extra_members,
+    )
+    added = 0
+    for member in staff_members:
+        before = {thread_member.id for thread_member in getattr(notes_thread, "members", [])}
+        await ensure_notes_participant(notes_thread, member)
+        if member.id not in before:
+            added += 1
+    return added
+
+
 async def create_or_get_notes_thread(
     bot: "TicketBot",
     guild: discord.Guild,
@@ -3051,7 +3147,7 @@ async def create_or_get_notes_thread(
     existing = await get_notes_thread(bot, guild, channel)
     clean_notes_name = notes_channel_name(channel)
     if existing is not None:
-        await ensure_notes_participant(existing, creator)
+        await sync_notes_thread_staff(bot, channel, existing, extra_members=[creator])
         await safe_edit_notes_name(existing, clean_notes_name, reason="Normalize staff notes thread name.")
         return existing, "existing"
 
@@ -3093,7 +3189,7 @@ async def create_or_get_notes_thread(
         clear_notes_thread_id(bot, guild.id, channel.id)
         return None, "Discord created a notes thread, but it was not linked under this ticket. I stopped to prevent mixed ticket notes."
 
-    await ensure_notes_participant(thread, creator)
+    await sync_notes_thread_staff(bot, channel, thread, extra_members=[creator])
     set_notes_thread_id(bot, guild.id, channel.id, thread.id)
     await thread.send(
         "📝 **Staff Notes**\n"
@@ -3348,6 +3444,9 @@ class AddUserModal(discord.ui.Modal, title="Add User To Ticket"):
         overwrite.embed_links = True
 
         await self.channel.set_permissions(member, overwrite=overwrite, reason=f"Added to ticket by {interaction.user}")
+        notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
+        if notes_thread is not None:
+            await sync_notes_thread_staff(self.bot, self.channel, notes_thread, extra_members=[member])
         await self.channel.send(f"➕ {member.mention} was added to this ticket by {interaction.user.mention}.")
         await interaction.response.send_message(f"Added {member.mention} to the ticket.", ephemeral=True)
 
@@ -3389,6 +3488,9 @@ class RemoveUserModal(discord.ui.Modal, title="Remove User From Ticket"):
             return
 
         await self.channel.set_permissions(member, overwrite=None, reason=f"Removed from ticket by {interaction.user}")
+        notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
+        if notes_thread is not None and isinstance(notes_thread, discord.Thread):
+            await remove_notes_participant(notes_thread, member)
         await self.channel.send(f"➖ {member.mention} was removed from this ticket by {interaction.user.mention}.")
         await interaction.response.send_message(f"Removed {member.mention} from the ticket.", ephemeral=True)
 
@@ -3433,6 +3535,9 @@ class AddRoleModal(discord.ui.Modal, title="Add Role To Ticket"):
         overwrite.mention_everyone = True
 
         await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role added to ticket by {interaction.user}")
+        notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
+        if notes_thread is not None:
+            await sync_notes_thread_staff(self.bot, self.channel, notes_thread)
         ping_sent, ping_warning = await send_role_ping_message(
             self.channel,
             [role],
@@ -3480,16 +3585,30 @@ class RemoveRoleModal(discord.ui.Modal, title="Remove Role From Ticket"):
             await interaction.response.send_message("You can't edit @everyone here.", ephemeral=True)
             return
 
-        overwrite = self.channel.overwrites_for(role)
-        overwrite.view_channel = False
-        overwrite.send_messages = False
-        overwrite.read_message_history = False
-        overwrite.attach_files = False
-        overwrite.embed_links = False
+        current_ping_role_ids = [role_id for role_id in get_ticket_ping_role_ids(self.channel) if role_id != role.id]
+        await update_ticket_metadata(self.channel, ping_role_ids=current_ping_role_ids)
 
-        await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role removed from ticket by {interaction.user}")
-        await self.channel.send(f"🔒 {role.mention} can no longer see this ticket.")
-        await interaction.response.send_message(f"Removed {role.mention} from this ticket.", ephemeral=True)
+        # Remove the ticket-specific channel overwrite completely. The old code
+        # changed the overwrite to explicit denies, which left the role sitting
+        # in Discord's channel-permissions list and made it look like the role
+        # could not be removed from the ticket.
+        await self.channel.set_permissions(role, overwrite=None, reason=f"Role removed from ticket by {interaction.user}")
+
+        notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
+        if notes_thread is not None and isinstance(notes_thread, discord.Thread):
+            for member in getattr(role, "members", []):
+                # Do not kick global/default staff out of notes just because a
+                # ticket-specific role was removed.
+                configured_staff_role_ids = set(get_role_ids_from_config(self.bot, interaction.guild.id, "normal_staff")) | set(get_role_ids_from_config(self.bot, interaction.guild.id, "priority_staff"))
+                member_role_ids = {member_role.id for member_role in getattr(member, "roles", [])}
+                if not ((configured_staff_role_ids & member_role_ids) or member.guild_permissions.manage_channels or member.guild_permissions.administrator):
+                    await remove_notes_participant(notes_thread, member)
+
+        await self.channel.send(f"🔒 Removed {role.mention} from this ticket's channel permissions.")
+        await interaction.response.send_message(
+            f"Removed the ticket-specific channel permission for {role.mention}. If the role still sees the ticket, it is inheriting access from the ticket category or from a default ticket access role.",
+            ephemeral=True,
+        )
 
 
 class SetPingRolesModal(discord.ui.Modal, title="Set Ticket Ping Roles"):
@@ -4099,6 +4218,9 @@ class TicketChannelView(discord.ui.View):
             reason=f"Ticket claimed by {interaction.user} ({interaction.user.id})",
         )
         await refresh_ticket_status_message(self.bot, channel, status="Claimed")
+        notes_thread = await get_notes_thread(self.bot, interaction.guild, channel)
+        if notes_thread is not None:
+            await sync_notes_thread_staff(self.bot, channel, notes_thread, extra_members=[interaction.user])
         claim_embed = build_ticket_event_embed(
             title="📌 Ticket Claimed",
             description=f"{interaction.user.mention} claimed this ticket.",
