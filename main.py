@@ -974,6 +974,101 @@ async def safe_edit_notes_name(notes_channel: discord.abc.GuildChannel, name: st
         pass
 
 
+async def place_notes_channel_below_ticket(
+    notes_channel: discord.TextChannel,
+    ticket_channel: discord.TextChannel,
+    *,
+    reason: str = "Place staff notes directly under linked ticket.",
+) -> bool:
+    """Keep visible staff-notes channels directly under their ticket channel.
+
+    Discord text channels cannot truly be attached/nested under another text
+    channel. The closest safe behavior is to keep `notes-####` immediately below
+    its matching ticket in the same category. This only edits channel/category
+    placement and category sync; it does not edit any Discord role permissions.
+    """
+    if not isinstance(notes_channel, discord.TextChannel) or not isinstance(ticket_channel, discord.TextChannel):
+        return False
+    if notes_channel.id == ticket_channel.id:
+        return False
+
+    category = ticket_channel.category
+    if category is None:
+        return False
+
+    moved = False
+    try:
+        if getattr(notes_channel.category, "id", None) != category.id:
+            await notes_channel.edit(
+                category=category,
+                sync_permissions=True,
+                reason=f"{reason} Move notes into ticket category.",
+            )
+            moved = True
+
+        ordered_channels = sorted(category.text_channels, key=lambda item: item.position)
+        try:
+            ticket_index = next(index for index, channel in enumerate(ordered_channels) if channel.id == ticket_channel.id)
+        except StopIteration:
+            ticket_index = -1
+
+        already_below = (
+            ticket_index >= 0
+            and ticket_index + 1 < len(ordered_channels)
+            and ordered_channels[ticket_index + 1].id == notes_channel.id
+        )
+        if already_below:
+            return moved
+
+        await notes_channel.move(
+            after=ticket_channel,
+            sync_permissions=True,
+            reason=reason,
+        )
+        return True
+    except (discord.Forbidden, discord.HTTPException, TypeError):
+        return moved
+
+
+async def repair_visible_notes_position_for_ticket(ticket_channel: discord.TextChannel) -> int:
+    """Move every visible notes channel for one ticket directly below that ticket."""
+    if not isinstance(ticket_channel, discord.TextChannel) or not is_ticket_channel(ticket_channel):
+        return 0
+
+    moved_count = 0
+    for notes_channel in find_legacy_notes_channels_for_ticket(ticket_channel.guild, ticket_channel):
+        if not isinstance(notes_channel, discord.TextChannel):
+            continue
+        if await place_notes_channel_below_ticket(
+            notes_channel,
+            ticket_channel,
+            reason="Keep staff notes directly under linked ticket.",
+        ):
+            moved_count += 1
+    return moved_count
+
+
+async def repair_all_visible_notes_positions(bot: "TicketBot") -> dict[str, int]:
+    """Best-effort startup cleanup for existing visible staff-notes channels."""
+    scanned_tickets = 0
+    moved_notes = 0
+
+    for guild in bot.guilds:
+        try:
+            categories = await get_ticket_lookup_categories(bot, guild)
+        except Exception:
+            categories = []
+
+        for category in categories:
+            for channel in list(category.text_channels):
+                if not is_ticket_channel(channel):
+                    continue
+                scanned_tickets += 1
+                moved_notes += await repair_visible_notes_position_for_ticket(channel)
+
+    return {"scanned_tickets": scanned_tickets, "moved_notes": moved_notes}
+
+
 def normalize_panel_image_url(url: str) -> str:
     value = url.strip()
     if not value:
@@ -3206,9 +3301,9 @@ def save_ticket_log_text(guild_id: int, ticket_id: str, transcript_text: str) ->
 def notes_source_belongs_to_ticket(notes_source: Any, ticket_channel: discord.TextChannel) -> bool:
     """Return True when a staff-notes source belongs to this exact ticket.
 
-    New notes are visible text channels synced to the ticket category. Older
-    builds used private threads under the ticket; those are still recognized so
-    existing tickets can be closed/transcripted safely.
+    Current notes are Discord threads attached to the ticket channel. Legacy
+    visible notes text channels from older patches are still recognized so they
+    can be included in transcripts and migrated away from on the next /snotes.
     """
     if notes_source is None:
         return False
@@ -3221,6 +3316,8 @@ def notes_source_belongs_to_ticket(notes_source: Any, ticket_channel: discord.Te
         parent = getattr(notes_source, "parent", None)
         return getattr(parent, "id", None) == ticket_channel.id
 
+    # Legacy visible notes text channels only. New notes should not be created
+    # as standalone channels anymore.
     if isinstance(notes_source, discord.TextChannel):
         if notes_source.id == ticket_channel.id:
             return False
@@ -3237,33 +3334,58 @@ def notes_source_belongs_to_ticket(notes_source: Any, ticket_channel: discord.Te
 
 
 def notes_thread_belongs_to_ticket(notes_channel: discord.abc.GuildChannel, ticket_channel: discord.TextChannel) -> bool:
-    """Backward-compatible alias for old private-thread notes checks."""
+    """Backward-compatible alias for notes-source checks."""
     return notes_source_belongs_to_ticket(notes_channel, ticket_channel)
+
+
+def is_private_notes_thread(thread: Any) -> bool:
+    return isinstance(thread, discord.Thread) and getattr(thread, "type", None) == discord.ChannelType.private_thread
+
+
+def is_public_notes_thread(thread: Any) -> bool:
+    return isinstance(thread, discord.Thread) and getattr(thread, "type", None) == discord.ChannelType.public_thread
+
+
+async def notes_thread_should_be_private(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    ticket_channel: discord.TextChannel,
+) -> bool:
+    """Return True when a public thread would expose notes to the ticket opener.
+
+    Public threads inherit the parent ticket channel's visibility. Since normal
+    tickets grant the opener access to the parent channel, a public notes thread
+    would be visible/discoverable to that opener. In that common case, a private
+    thread is the only Discord-supported way to keep notes attached to the ticket
+    while keeping them staff-only.
+    """
+    owner_id = get_ticket_owner_id(ticket_channel)
+    if not owner_id:
+        return True
+
+    owner = guild.get_member(owner_id)
+    if owner is None:
+        owner = await fetch_member_safe(guild, owner_id)
+
+    if owner is None:
+        return True
+
+    # If the opener is staff, a public thread does not expose staff notes to a
+    # non-staff player. For regular player tickets, private is required.
+    return not member_is_staff(bot, owner)
 
 
 async def find_cached_notes_thread_for_ticket(
     guild: discord.Guild,
     channel: discord.TextChannel,
 ) -> Optional[Any]:
-    """Reconnect to an existing notes source for this ticket.
+    """Reconnect to an existing notes thread for this ticket.
 
-    Prefer visible text-channel notes because staff can see those in the normal
-    server channel list. Private threads from older builds are only used as a
-    fallback for old tickets that have not been migrated yet.
+    New staff notes live as threads attached to the ticket channel. Legacy
+    visible text-channel notes are intentionally not returned here so /snotes can
+    create the proper attached thread and update the mapping.
     """
     expected_name = notes_channel_name(channel)
-
-    text_candidates: list[discord.TextChannel] = []
-    for candidate in guild.text_channels:
-        if not notes_source_belongs_to_ticket(candidate, channel):
-            continue
-        if candidate.name == expected_name or candidate.name.startswith(f"{expected_name}-"):
-            text_candidates.append(candidate)
-
-    if text_candidates:
-        text_candidates.sort(key=lambda notes_channel: notes_channel.created_at or now_utc(), reverse=True)
-        return text_candidates[0]
-
     thread_candidates: list[discord.Thread] = []
     channel_threads = getattr(channel, "threads", []) or []
     guild_threads = getattr(guild, "threads", []) or []
@@ -3279,7 +3401,14 @@ async def find_cached_notes_thread_for_ticket(
     if not thread_candidates:
         return None
 
-    thread_candidates.sort(key=lambda thread: getattr(thread, "created_at", None) or now_utc(), reverse=True)
+    # Prefer active/unarchived threads, then newest.
+    thread_candidates.sort(
+        key=lambda thread: (
+            0 if getattr(thread, "archived", False) else 1,
+            getattr(thread, "created_at", None) or now_utc(),
+        ),
+        reverse=True,
+    )
     return thread_candidates[0]
 
 
@@ -3288,16 +3417,17 @@ async def get_notes_thread(
     guild: discord.Guild,
     channel: discord.TextChannel,
 ) -> Optional[Any]:
-    """Return this ticket's mapped staff-notes source.
+    """Return this ticket's mapped staff-notes thread.
 
-    The name is kept for compatibility, but the returned source may now be a
-    visible staff-only text channel instead of an old private thread.
+    The config key name is kept for compatibility. If it points at a legacy
+    visible notes text channel, the mapping is cleared so a proper attached
+    thread can be created on the next /snotes.
     """
     notes_id = get_notes_thread_id(bot, guild.id, channel.id)
     if notes_id:
-        notes_channel: Optional[Any] = guild.get_channel(notes_id)
+        notes_channel: Optional[Any] = guild.get_thread(notes_id)
         if notes_channel is None:
-            notes_channel = guild.get_thread(notes_id)
+            notes_channel = guild.get_channel(notes_id)
 
         if notes_channel is None:
             try:
@@ -3305,10 +3435,11 @@ async def get_notes_thread(
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 notes_channel = None
 
-        if notes_channel is not None and notes_source_belongs_to_ticket(notes_channel, channel):
+        if isinstance(notes_channel, discord.Thread) and notes_source_belongs_to_ticket(notes_channel, channel):
             return notes_channel
 
-        # Never reuse a notes channel/thread that does not belong under this ticket.
+        # A mapped text channel is a legacy visible notes channel from the old
+        # patch. Do not keep returning it as the live notes destination.
         clear_notes_thread_id(bot, guild.id, channel.id)
 
     cached = await find_cached_notes_thread_for_ticket(guild, channel)
@@ -3321,11 +3452,10 @@ async def get_notes_thread(
 
 
 def legacy_notes_channel_belongs_to_ticket(notes_channel: discord.abc.GuildChannel, ticket_channel: discord.TextChannel) -> bool:
-    """Return True for visible staff notes channels linked to this exact ticket.
+    """Return True for legacy visible staff-notes text channels linked to this ticket.
 
-    New notes are visible text channels synced to the ticket category so staff can
-    find them in the server channel list. Older private-thread notes are handled
-    by `notes_source_belongs_to_ticket` and may still be used for old tickets.
+    New notes are no longer standalone text channels. Legacy channels are kept
+    detectable for transcript inclusion and manual cleanup.
     """
     return isinstance(notes_channel, discord.TextChannel) and notes_source_belongs_to_ticket(notes_channel, ticket_channel)
 
@@ -3334,7 +3464,7 @@ def find_legacy_notes_channels_for_ticket(
     guild: discord.Guild,
     ticket_channel: discord.TextChannel,
 ) -> list[discord.abc.GuildChannel]:
-    """Find visible notes text channels for this ticket.
+    """Find old visible notes text channels for this ticket.
 
     The function name is kept for compatibility with the close/transcript flow.
     """
@@ -3353,12 +3483,16 @@ def resolve_ticket_channel_from_context(
     guild: discord.Guild,
     channel: Optional[discord.abc.Messageable],
 ) -> Optional[discord.TextChannel]:
-    """Resolve the ticket text channel from a ticket channel, notes channel, or old notes channel."""
+    """Resolve the ticket text channel from a ticket channel, notes thread, or old notes channel."""
     if isinstance(channel, discord.TextChannel) and is_ticket_channel(channel):
         return channel
 
     if isinstance(channel, discord.Thread):
         parent = channel.parent
+        if parent is None:
+            parent_id = getattr(channel, "parent_id", None)
+            if parent_id:
+                parent = guild.get_channel(int(parent_id))
         if isinstance(parent, discord.TextChannel) and is_ticket_channel(parent):
             return parent
 
@@ -3390,7 +3524,7 @@ def format_notes_sources_for_embed(
     if notes_thread is not None:
         sources.append(source_label(notes_thread, "notes-thread"))
     for notes_channel in legacy_notes_channels or []:
-        sources.append(source_label(notes_channel, "notes-channel"))
+        sources.append(source_label(notes_channel, "legacy-notes-channel"))
 
     if not sources:
         return "No staff notes were linked."
@@ -3398,8 +3532,8 @@ def format_notes_sources_for_embed(
 
 
 async def ensure_notes_participant(notes_channel, member: discord.Member) -> None:
-    """If staff notes are a private thread, add the staff member to it."""
-    if isinstance(notes_channel, discord.Thread):
+    """Add a staff member to a private staff-notes thread when needed."""
+    if is_private_notes_thread(notes_channel):
         try:
             await notes_channel.add_user(member)
         except (discord.Forbidden, discord.HTTPException):
@@ -3407,8 +3541,8 @@ async def ensure_notes_participant(notes_channel, member: discord.Member) -> Non
 
 
 async def remove_notes_participant(notes_channel, member: discord.Member) -> None:
-    """Remove a member from a private staff-notes channel when ticket access is removed."""
-    if isinstance(notes_channel, discord.Thread):
+    """Remove a member from a private staff-notes thread when ticket access is removed."""
+    if is_private_notes_thread(notes_channel):
         try:
             await notes_channel.remove_user(member)
         except (discord.Forbidden, discord.HTTPException):
@@ -3422,13 +3556,10 @@ def cached_ticket_staff_members_for_notes(
     *,
     extra_members: Optional[list[discord.Member]] = None,
 ) -> list[discord.Member]:
-    """Return cached staff members that should be added to this ticket's notes channel.
+    """Return cached staff members that should be added to this ticket's notes thread.
 
-    Private Discord threads do not inherit role membership the same way the
-    parent ticket channel does. If only the staff member who runs /notes is
-    added, every other staff member has to run /notes before they can see the
-    thread. This helper adds the ticket's staff automatically while keeping the
-    ticket owner/player out of staff notes.
+    Private threads do not grant role membership automatically. This helper adds
+    cached configured staff while keeping the ticket owner/player out of notes.
     """
     owner_id = get_ticket_owner_id(ticket_channel) or 0
     bot_id = int(getattr(getattr(guild, "me", None), "id", 0) or 0)
@@ -3442,8 +3573,6 @@ def cached_ticket_staff_members_for_notes(
         if member.bot or member.id in {owner_id, bot_id} or member.id in seen:
             return
         member_role_ids = {role.id for role in getattr(member, "roles", [])}
-        # Staff notes should stay staff-only. A user/role may be added to the
-        # public ticket without being allowed into internal notes.
         if not (
             (configured_staff_role_ids & member_role_ids)
             or member.guild_permissions.manage_channels
@@ -3456,10 +3585,6 @@ def cached_ticket_staff_members_for_notes(
     for member in extra_members or []:
         add_member(member)
 
-    # Add cached members from every role that can see this ticket. This covers
-    # normal staff, priority staff, and ticket-specific role overwrites. Full
-    # coverage requires Discord's Server Members Intent; without it, Discord may
-    # only expose members that are already cached.
     for target, overwrite in ticket_channel.overwrites.items():
         if isinstance(target, discord.Role) and not target.is_default() and overwrite.view_channel is True:
             for member in getattr(target, "members", []):
@@ -3467,8 +3592,6 @@ def cached_ticket_staff_members_for_notes(
         elif isinstance(target, discord.Member) and overwrite.view_channel is True:
             add_member(target)
 
-    # Also include configured staff roles, even if Discord is inheriting their
-    # ticket access from a category instead of a direct channel overwrite.
     for role in unique_roles(get_staff_roles(bot, guild), get_priority_staff_roles(bot, guild)):
         for member in getattr(role, "members", []):
             add_member(member)
@@ -3483,8 +3606,8 @@ async def sync_notes_thread_staff(
     *,
     extra_members: Optional[list[discord.Member]] = None,
 ) -> int:
-    """Add all currently known ticket staff to the ticket's private notes thread."""
-    if notes_thread is None or not isinstance(notes_thread, discord.Thread):
+    """Add all currently known ticket staff to a private staff-notes thread."""
+    if notes_thread is None or not is_private_notes_thread(notes_thread):
         return 0
 
     staff_members = cached_ticket_staff_members_for_notes(
@@ -3502,110 +3625,142 @@ async def sync_notes_thread_staff(
     return added
 
 
+async def archive_lock_notes_thread(notes_thread: Optional[discord.abc.GuildChannel], *, reason: str) -> None:
+    """Best-effort lock/archive for notes threads during ticket close."""
+    if not isinstance(notes_thread, discord.Thread):
+        return
+
+    try:
+        await notes_thread.edit(archived=True, locked=True, reason=reason)
+    except TypeError:
+        try:
+            await notes_thread.edit(archived=True, reason=reason)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    except (discord.Forbidden, discord.HTTPException):
+        try:
+            await notes_thread.edit(archived=True, reason=reason)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+async def create_ticket_notes_thread(
+    bot: "TicketBot",
+    channel: discord.TextChannel,
+    creator: discord.Member,
+    *,
+    private_thread: bool,
+) -> discord.Thread:
+    clean_notes_name = notes_channel_name(channel)
+    thread_type = discord.ChannelType.private_thread if private_thread else discord.ChannelType.public_thread
+    reason = f"Staff notes thread created by {creator} ({creator.id}) for ticket {channel.id}"
+
+    kwargs: dict[str, Any] = {
+        "name": clean_notes_name[:100],
+        "type": thread_type,
+        "reason": reason,
+    }
+    if private_thread:
+        kwargs["invitable"] = False
+
+    try:
+        return await channel.create_thread(**kwargs)
+    except TypeError:
+        kwargs.pop("invitable", None)
+        return await channel.create_thread(**kwargs)
+
+
 async def create_or_get_notes_thread(
     bot: "TicketBot",
     guild: discord.Guild,
     channel: discord.TextChannel,
     creator: discord.Member,
 ) -> tuple[Optional[Any], str]:
-    """Create or open this ticket's staff notes as a visible text channel.
+    """Create or open this ticket's staff notes as a thread attached to the ticket.
 
-    Older builds created private threads, which do not reliably show in the
-    server channel list for every staff member. New notes are normal text
-    channels placed in the same ticket category and synced to that category's
-    permissions. This avoids changing global role permissions and keeps access
-    controlled from the category.
+    Discord public threads inherit the parent ticket channel visibility. Because
+    ticket openers can usually see their own ticket channel, public threads would
+    expose staff notes to non-staff openers. In that common case this uses a
+    private thread as the safest Discord-supported attached notes format. If the
+    ticket opener is staff, a public inherited thread is safe and may be used.
     """
     existing = await get_notes_thread(bot, guild, channel)
     clean_notes_name = notes_channel_name(channel)
 
-    if isinstance(existing, discord.TextChannel):
-        await safe_edit_notes_name(existing, clean_notes_name, reason="Normalize staff notes channel name.")
+    if isinstance(existing, discord.Thread):
+        await safe_edit_notes_name(existing, clean_notes_name, reason="Normalize staff notes thread name.")
+        if is_private_notes_thread(existing):
+            await ensure_notes_participant(existing, creator)
+            await sync_notes_thread_staff(bot, channel, existing, extra_members=[creator])
         return existing, "existing"
 
-    # If an old private notes thread exists, do not keep returning that hidden
-    # thread. Create a visible notes channel and overwrite the mapping so old
-    # tickets update the next time staff runs /snotes or /ticketnotes.
-    old_private_thread = existing if isinstance(existing, discord.Thread) else None
-
-    category = channel.category
-    if category is None:
-        return None, (
-            "This ticket is not inside a category, so I cannot safely create a visible staff-notes channel. "
-            "Move the ticket into the ticket category, then run `/snotes` again."
-        )
-
-    topic = (
-        f"staff_notes_for:{channel.id}|"
-        f"ticket_number:{get_ticket_number(channel)}|"
-        f"ticket_type:{get_ticket_kind(channel)}"
-    )[:1024]
+    legacy_notes_channels = find_legacy_notes_channels_for_ticket(guild, channel)
+    private_thread_required = await notes_thread_should_be_private(bot, guild, channel)
 
     try:
-        notes_channel = await guild.create_text_channel(
-            name=clean_notes_name[:100],
-            category=category,
-            topic=topic,
-            reason=f"Visible staff notes created by {creator} ({creator.id}) for ticket {channel.id}",
+        notes_thread = await create_ticket_notes_thread(
+            bot,
+            channel,
+            creator,
+            private_thread=private_thread_required,
         )
     except discord.Forbidden:
+        needed = "Create Private Threads" if private_thread_required else "Create Public Threads"
         return None, (
-            "I could not create a visible staff-notes channel in the ticket category.\n\n"
-            "Give the bot **Manage Channels**, **View Channels**, and **Send Messages** in the ticket category. "
-            "Staff access should be controlled from the **category permissions**; I did not change any role permissions."
+            f"I could not create the staff-notes thread under {channel.mention}.\n\n"
+            f"Give the bot **{needed}**, **Send Messages in Threads**, **View Channel**, and **Manage Threads** in this ticket/category. "
+            "I did not change any role, category, or global permissions."
         )
     except discord.HTTPException as exc:
-        return None, f"Discord refused to create the staff-notes channel: `{truncate(str(exc), 500)}`"
+        return None, f"Discord refused to create the staff-notes thread: `{truncate(str(exc), 500)}`"
 
-    try:
-        await notes_channel.edit(sync_permissions=True, reason="Sync staff notes channel to ticket category permissions.")
-    except (discord.Forbidden, discord.HTTPException, TypeError):
-        # The channel was created successfully. If Discord refuses the sync call,
-        # keep it and rely on the category permissions inherited at creation.
-        pass
-
-    if not notes_source_belongs_to_ticket(notes_channel, channel):
+    if not notes_source_belongs_to_ticket(notes_thread, channel):
         try:
-            await notes_channel.delete(reason="Staff notes channel did not link back to the correct ticket.")
-        except discord.HTTPException:
+            await notes_thread.edit(archived=True, locked=True, reason="Staff notes thread did not link to the correct ticket.")
+        except (discord.Forbidden, discord.HTTPException, TypeError):
             pass
         clear_notes_thread_id(bot, guild.id, channel.id)
-        return None, "Discord created a notes channel, but it was not linked to this ticket. I stopped to prevent mixed ticket notes."
+        return None, "Discord created a notes thread, but it was not linked to this ticket. I stopped to prevent mixed ticket notes."
 
-    set_notes_thread_id(bot, guild.id, channel.id, notes_channel.id)
+    set_notes_thread_id(bot, guild.id, channel.id, notes_thread.id)
 
-    old_thread_notice = ""
-    if old_private_thread is not None:
-        old_thread_notice = (
-            f"\n\nMigrated from old private notes thread: {old_private_thread.mention} (`{old_private_thread.id}`). "
-            "Use this visible notes channel going forward."
+    if private_thread_required:
+        await ensure_notes_participant(notes_thread, creator)
+        await sync_notes_thread_staff(bot, channel, notes_thread, extra_members=[creator])
+
+    visibility_note = (
+        "This is a **private staff-only thread** because public threads under a ticket can be seen by anyone who can view the ticket channel. "
+        "That is required to keep the ticket opener out of staff notes."
+        if private_thread_required
+        else "This is a **public thread** that inherits the parent ticket channel permissions because the ticket opener is staff."
+    )
+
+    legacy_notice = ""
+    if legacy_notes_channels:
+        legacy_notice = (
+            "\n\nLegacy visible notes channel(s) were found for this ticket: "
+            + ", ".join(notes_channel.mention for notes_channel in legacy_notes_channels)
+            + "\nThey were left untouched, but will still be included in this ticket's transcript."
         )
-        try:
-            await old_private_thread.send(
-                f"📝 A visible staff-notes channel was created for this ticket: {notes_channel.mention}\n"
-                "Use the visible channel going forward."
-            )
-        except discord.HTTPException:
-            pass
 
     try:
-        await notes_channel.send(
+        await notes_thread.send(
             "📝 **Staff Notes**\n"
             f"Linked ticket: {channel.mention} (`{channel.id}`)\n"
             f"Ticket number: `{get_ticket_number(channel)}`\n\n"
-            "Use this visible staff-only notes channel for this ticket. These notes are appended to this ticket transcript when the ticket closes.\n"
-            "Access is inherited from the ticket category permissions; the bot did not edit any Discord role permissions."
-            f"{old_thread_notice}"
+            "Use this attached notes thread for staff-only notes. These notes are appended to this ticket transcript when the ticket closes.\n"
+            f"{visibility_note} The bot did not edit any Discord role, category, or global permissions."
+            f"{legacy_notice}"
         )
     except discord.Forbidden:
         return None, (
-            f"I created {notes_channel.mention}, but I cannot send messages there. "
-            "Fix the ticket category permissions for the bot, then run `/snotes` again."
+            f"I created {notes_thread.mention}, but I cannot send messages there. "
+            "Fix the bot's thread permissions, then run `/snotes` again."
         )
     except discord.HTTPException as exc:
-        return None, f"I created {notes_channel.mention}, but Discord rejected the starter message: `{truncate(str(exc), 500)}`"
+        return None, f"I created {notes_thread.mention}, but Discord rejected the starter message: `{truncate(str(exc), 500)}`"
 
-    return notes_channel, "created"
+    return notes_thread, "created"
 
 
 async def create_ticket_channel(
@@ -4423,13 +4578,23 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             except discord.HTTPException:
                 pass
 
+            # Do not auto-delete old visible notes text channels. They may contain
+            # staff context from an older patch, so leave cleanup to staff after
+            # confirming the transcript/log.
             for legacy_notes_channel in legacy_notes_channels:
                 try:
-                    await legacy_notes_channel.delete(reason=f"Ticket {self.channel.id} closed; legacy staff notes transcript saved.")
+                    await legacy_notes_channel.send(
+                        "ℹ️ The linked ticket was closed and this notes channel was included in the transcript. "
+                        "It was left in place for manual staff cleanup."
+                    )
                 except discord.HTTPException:
                     pass
 
             if notes_thread is not None:
+                await archive_lock_notes_thread(
+                    notes_thread,
+                    reason=f"Ticket {self.channel.id} closed; staff notes transcript saved.",
+                )
                 clear_notes_thread_id(self.bot, interaction.guild.id, self.channel.id)
 
             await safe_followup("Transcript saved. Deleting this ticket channel now.")
@@ -4614,7 +4779,7 @@ class TicketChannelView(discord.ui.View):
         )
         await refresh_ticket_status_message(self.bot, channel, status="Claimed")
         notes_thread = await get_notes_thread(self.bot, interaction.guild, channel)
-        if notes_thread is not None:
+        if isinstance(notes_thread, discord.Thread):
             await sync_notes_thread_staff(self.bot, channel, notes_thread, extra_members=[interaction.user])
         claim_embed = build_ticket_event_embed(
             title="📌 Ticket Claimed",
@@ -4666,6 +4831,9 @@ class TicketChannelView(discord.ui.View):
             ticket_base_channel_name(channel),
             reason=f"Ticket unclaimed by {interaction.user} ({interaction.user.id})",
         )
+        notes_thread = await get_notes_thread(self.bot, interaction.guild, channel)
+        if isinstance(notes_thread, discord.Thread):
+            await sync_notes_thread_staff(self.bot, channel, notes_thread)
         await refresh_ticket_status_message(self.bot, channel, status="Open")
         unclaim_embed = build_ticket_event_embed(
             title="📌 Ticket Unclaimed",
@@ -5286,7 +5454,7 @@ class TicketCommands(commands.Cog):
 
         await interaction.response.send_message(response, allowed_mentions=discord.AllowedMentions.none())
 
-    @app_commands.command(name="ticketnotes", description="Create or open the staff-only notes channel for this ticket.")
+    @app_commands.command(name="ticketnotes", description="Create or open the staff-only notes thread for this ticket.")
     @app_commands.default_permissions(manage_messages=True)
     async def ticket_notes(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -5314,12 +5482,12 @@ class TicketCommands(commands.Cog):
             legacy_notice = (
                 "\n\nI also found old separate notes channel(s) for this ticket: "
                 + ", ".join(notes_channel.mention for notes_channel in legacy_notes_channels)
-                + "\nThey will be included in the transcript and deleted when this ticket closes."
+                + "\nThey will be included in the transcript and left alone for manual cleanup."
             )
 
         msg = "Created" if status == "created" else "Opened existing"
         await interaction.followup.send(
-            f"{msg} staff notes channel: {thread.mention}\n"
+            f"{msg} staff notes thread: {thread.mention}\n"
             f"Notes will be appended under a **STAFF NOTES** divider in the ticket transcript."
             f"{legacy_notice}",
             ephemeral=True,
@@ -6013,7 +6181,7 @@ class StarzShortcutCommands(commands.Cog):
         ticket_channel = resolve_ticket_channel_from_context(interaction.guild, interaction.channel)
         if ticket_channel is None:
             await interaction.response.send_message(
-                "Use `/sclose` inside a ticket channel or its staff-notes channel.",
+                "Use `/sclose` inside a ticket channel, staff-notes thread, or legacy staff-notes channel.",
                 ephemeral=True,
             )
             return
@@ -6025,7 +6193,7 @@ class StarzShortcutCommands(commands.Cog):
 
         await interaction.response.send_modal(CloseTicketModal(self.bot, ticket_channel))
 
-    @app_commands.command(name="snotes", description="Create or open the STARZ staff-notes channel for this ticket.")
+    @app_commands.command(name="snotes", description="Create or open the STARZ staff-notes thread for this ticket.")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_messages=True)
     async def snotes(self, interaction: discord.Interaction) -> None:
@@ -6036,7 +6204,7 @@ class StarzShortcutCommands(commands.Cog):
         ticket_channel = resolve_ticket_channel_from_context(interaction.guild, interaction.channel)
         if ticket_channel is None:
             await interaction.response.send_message(
-                "Use `/snotes` inside a ticket channel or its staff-notes channel.",
+                "Use `/snotes` inside a ticket channel, staff-notes thread, or legacy staff-notes channel.",
                 ephemeral=True,
             )
             return
@@ -6057,12 +6225,12 @@ class StarzShortcutCommands(commands.Cog):
             legacy_notice = (
                 "\n\nI also found old separate notes channel(s) for this ticket: "
                 + ", ".join(notes_channel.mention for notes_channel in legacy_notes_channels)
-                + "\nThey will be included in the transcript and deleted when this ticket closes."
+                + "\nThey will be included in the transcript and left alone for manual cleanup."
             )
 
         msg = "Created" if status == "created" else "Opened existing"
         await interaction.followup.send(
-            f"{msg} staff notes channel: {thread.mention}\n"
+            f"{msg} staff notes thread: {thread.mention}\n"
             f"Notes will be appended under a **STAFF NOTES** divider in the ticket transcript."
             f"{legacy_notice}",
             ephemeral=True,
