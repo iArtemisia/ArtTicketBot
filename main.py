@@ -3265,7 +3265,10 @@ async def build_ticket_and_notes_transcript_text(
         for notes_source, staff_note_messages in visible_notes:
             if not staff_note_messages:
                 continue
-            source_type = "Private Thread" if isinstance(notes_source, discord.Thread) else "Visible Notes Channel"
+            if isinstance(notes_source, discord.Thread):
+                source_type = "Private Thread" if is_private_notes_thread(notes_source) else "Public Thread"
+            else:
+                source_type = "Visible Notes Channel"
             append_transcript_subsection(lines, f"{source_type}: #{clean_transcript_text(getattr(notes_source, 'name', 'notes'))} ({notes_source.id})")
             append_messages_grouped_by_day(
                 lines,
@@ -3351,39 +3354,26 @@ async def notes_thread_should_be_private(
     guild: discord.Guild,
     ticket_channel: discord.TextChannel,
 ) -> bool:
-    """Return True when a public thread would expose notes to the ticket opener.
+    """Staff notes must always use private attached threads.
 
-    Public threads inherit the parent ticket channel's visibility. Since normal
-    tickets grant the opener access to the parent channel, a public notes thread
-    would be visible/discoverable to that opener. In that common case, a private
-    thread is the only Discord-supported way to keep notes attached to the ticket
-    while keeping them staff-only.
+    Discord public threads inherit the parent ticket channel visibility, which
+    means a ticket opener who can view their ticket can also discover/read the
+    public notes thread. To keep notes attached under the ticket while keeping
+    them staff-only, always use a private thread and add staff as participants.
     """
-    owner_id = get_ticket_owner_id(ticket_channel)
-    if not owner_id:
-        return True
-
-    owner = guild.get_member(owner_id)
-    if owner is None:
-        owner = await fetch_member_safe(guild, owner_id)
-
-    if owner is None:
-        return True
-
-    # If the opener is staff, a public thread does not expose staff notes to a
-    # non-staff player. For regular player tickets, private is required.
-    return not member_is_staff(bot, owner)
+    return True
 
 
 async def find_cached_notes_thread_for_ticket(
     guild: discord.Guild,
     channel: discord.TextChannel,
 ) -> Optional[Any]:
-    """Reconnect to an existing notes thread for this ticket.
+    """Reconnect to an existing private notes thread for this ticket.
 
-    New staff notes live as threads attached to the ticket channel. Legacy
-    visible text-channel notes are intentionally not returned here so /snotes can
-    create the proper attached thread and update the mapping.
+    Staff notes should be private threads attached to the ticket channel. Legacy
+    visible text-channel notes and older public notes threads are intentionally
+    not returned here so /snotes can create the proper private attached thread
+    and update the mapping.
     """
     expected_name = notes_channel_name(channel)
     thread_candidates: list[discord.Thread] = []
@@ -3392,6 +3382,8 @@ async def find_cached_notes_thread_for_ticket(
 
     for thread in list(channel_threads) + list(guild_threads):
         if not isinstance(thread, discord.Thread):
+            continue
+        if not is_private_notes_thread(thread):
             continue
         if not notes_source_belongs_to_ticket(thread, channel):
             continue
@@ -3435,11 +3427,17 @@ async def get_notes_thread(
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 notes_channel = None
 
-        if isinstance(notes_channel, discord.Thread) and notes_source_belongs_to_ticket(notes_channel, channel):
+        if (
+            isinstance(notes_channel, discord.Thread)
+            and is_private_notes_thread(notes_channel)
+            and notes_source_belongs_to_ticket(notes_channel, channel)
+        ):
             return notes_channel
 
-        # A mapped text channel is a legacy visible notes channel from the old
-        # patch. Do not keep returning it as the live notes destination.
+        # Mapped public threads and mapped text channels are legacy notes
+        # destinations from older patches. Do not keep returning them as the
+        # live staff-notes destination. /snotes will create/find a private
+        # attached thread under the ticket and update this mapping.
         clear_notes_thread_id(bot, guild.id, channel.id)
 
     cached = await find_cached_notes_thread_for_ticket(guild, channel)
@@ -3610,6 +3608,23 @@ async def sync_notes_thread_staff(
     if notes_thread is None or not is_private_notes_thread(notes_thread):
         return 0
 
+    # Make the thread active/visible for invited staff where Discord allows it.
+    try:
+        await notes_thread.join()
+    except (discord.Forbidden, discord.HTTPException, AttributeError):
+        pass
+
+    if getattr(notes_thread, "archived", False):
+        try:
+            await notes_thread.edit(archived=False, locked=False, reason="Re-open staff notes thread for active ticket.")
+        except TypeError:
+            try:
+                await notes_thread.edit(archived=False, reason="Re-open staff notes thread for active ticket.")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
     staff_members = cached_ticket_staff_members_for_notes(
         bot,
         ticket_channel.guild,
@@ -3676,22 +3691,20 @@ async def create_or_get_notes_thread(
     channel: discord.TextChannel,
     creator: discord.Member,
 ) -> tuple[Optional[Any], str]:
-    """Create or open this ticket's staff notes as a thread attached to the ticket.
+    """Create or open this ticket's staff notes as a private attached thread.
 
-    Discord public threads inherit the parent ticket channel visibility. Because
-    ticket openers can usually see their own ticket channel, public threads would
-    expose staff notes to non-staff openers. In that common case this uses a
-    private thread as the safest Discord-supported attached notes format. If the
-    ticket opener is staff, a public inherited thread is safe and may be used.
+    Private threads stay attached under the parent ticket channel for invited
+    staff, while keeping the ticket opener out of staff notes. The bot should
+    never create separate visible notes text channels or public notes threads as
+    the live notes destination.
     """
     existing = await get_notes_thread(bot, guild, channel)
     clean_notes_name = notes_channel_name(channel)
 
     if isinstance(existing, discord.Thread):
         await safe_edit_notes_name(existing, clean_notes_name, reason="Normalize staff notes thread name.")
-        if is_private_notes_thread(existing):
-            await ensure_notes_participant(existing, creator)
-            await sync_notes_thread_staff(bot, channel, existing, extra_members=[creator])
+        await ensure_notes_participant(existing, creator)
+        await sync_notes_thread_staff(bot, channel, existing, extra_members=[creator])
         return existing, "existing"
 
     legacy_notes_channels = find_legacy_notes_channels_for_ticket(guild, channel)
@@ -3702,13 +3715,12 @@ async def create_or_get_notes_thread(
             bot,
             channel,
             creator,
-            private_thread=private_thread_required,
+            private_thread=True,
         )
     except discord.Forbidden:
-        needed = "Create Private Threads" if private_thread_required else "Create Public Threads"
         return None, (
-            f"I could not create the staff-notes thread under {channel.mention}.\n\n"
-            f"Give the bot **{needed}**, **Send Messages in Threads**, **View Channel**, and **Manage Threads** in this ticket/category. "
+            f"I could not create the private staff-notes thread under {channel.mention}.\n\n"
+            "Give the bot **Create Private Threads**, **Send Messages in Threads**, **View Channel**, and **Manage Threads** in this ticket/category. "
             "I did not change any role, category, or global permissions."
         )
     except discord.HTTPException as exc:
@@ -3724,15 +3736,12 @@ async def create_or_get_notes_thread(
 
     set_notes_thread_id(bot, guild.id, channel.id, notes_thread.id)
 
-    if private_thread_required:
-        await ensure_notes_participant(notes_thread, creator)
-        await sync_notes_thread_staff(bot, channel, notes_thread, extra_members=[creator])
+    await ensure_notes_participant(notes_thread, creator)
+    await sync_notes_thread_staff(bot, channel, notes_thread, extra_members=[creator])
 
     visibility_note = (
-        "This is a **private staff-only thread** because public threads under a ticket can be seen by anyone who can view the ticket channel. "
-        "That is required to keep the ticket opener out of staff notes."
-        if private_thread_required
-        else "This is a **public thread** that inherits the parent ticket channel permissions because the ticket opener is staff."
+        "This is a **private staff-only thread** attached under the ticket channel. "
+        "Private threads are required because public threads can be seen by anyone who can view the parent ticket channel."
     )
 
     legacy_notice = ""
