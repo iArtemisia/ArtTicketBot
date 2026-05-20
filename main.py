@@ -1207,6 +1207,24 @@ def unique_roles(*role_lists: list[discord.Role]) -> list[discord.Role]:
     return result
 
 
+def ticket_role_access_overwrite() -> discord.PermissionOverwrite:
+    """Safe default overwrite for staff/access roles inside ticket channels.
+
+    This intentionally does NOT grant Manage Messages, Manage Threads,
+    Manage Channels, or Mention Everyone/All Roles. Higher staff should get
+    elevated powers from their actual Discord roles, not from every ticket
+    channel overwrite.
+    """
+    return discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        attach_files=True,
+        embed_links=True,
+        send_messages_in_threads=True,
+    )
+
+
 def role_allowed_mentions(roles: list[discord.Role] | None = None) -> discord.AllowedMentions:
     """Allow role mentions to parse for ticket alerts.
 
@@ -1344,6 +1362,68 @@ async def send_role_ping_message(
         )
 
     return True, ""
+
+
+async def repair_ticket_permission_overwrites(bot: "TicketBot", channel: discord.TextChannel) -> dict[str, int]:
+    """Remove dangerous ticket-channel grants from role overwrites.
+
+    Previous patches accidentally granted access roles permissions such as
+    Manage Messages, Manage Threads, and Mention Everyone/All Roles inside
+    every ticket. This repair keeps ticket visibility while clearing those
+    elevated channel-specific grants.
+    """
+    scanned = 0
+    repaired = 0
+
+    for target, overwrite in list(channel.overwrites.items()):
+        if not isinstance(target, discord.Role):
+            continue
+        if target.is_default() or target.managed:
+            continue
+        if overwrite.view_channel is not True:
+            continue
+
+        scanned += 1
+        safe_overwrite = ticket_role_access_overwrite()
+
+        # Preserve explicit deny values for non-dangerous basics if they existed,
+        # but remove elevated grants that made low-level roles too powerful.
+        safe_overwrite.manage_channels = None
+        safe_overwrite.manage_messages = None
+        safe_overwrite.manage_threads = None
+        safe_overwrite.mention_everyone = None
+        safe_overwrite.create_private_threads = None
+        safe_overwrite.create_public_threads = None
+        safe_overwrite.pin_messages = None
+
+        if overwrite != safe_overwrite:
+            await channel.set_permissions(
+                target,
+                overwrite=safe_overwrite,
+                reason="Repair ticket role permissions: remove elevated channel grants",
+            )
+            repaired += 1
+
+    return {"scanned": scanned, "repaired": repaired}
+
+
+async def repair_ticket_permissions_in_categories(bot: "TicketBot", guild: discord.Guild) -> dict[str, int]:
+    categories = await get_ticket_lookup_categories(bot, guild)
+    scanned = 0
+    repaired_channels = 0
+    repaired_roles = 0
+
+    for category in categories:
+        for channel in category.text_channels:
+            if not is_ticket_channel(channel):
+                continue
+            scanned += 1
+            result = await repair_ticket_permission_overwrites(bot, channel)
+            if result.get("repaired", 0):
+                repaired_channels += 1
+                repaired_roles += int(result.get("repaired", 0))
+
+    return {"scanned": scanned, "repaired_channels": repaired_channels, "repaired_roles": repaired_roles}
 
 
 def get_ticket_extra_roles(bot: "TicketBot", guild: discord.Guild, channel: discord.TextChannel) -> list[discord.Role]:
@@ -3281,18 +3361,11 @@ async def create_ticket_channel(
     ticket_role_overwrites = unique_roles(visible_roles, ping_roles)
 
     for role in ticket_role_overwrites:
-        overwrites[role] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_messages=True,
-            manage_threads=True,
-            create_private_threads=True,
-            send_messages_in_threads=True,
-            mention_everyone=True,
-            attach_files=True,
-            embed_links=True,
-        )
+        # Keep low-level and upper staff permission tiers separate.
+        # Ticket access should only grant ticket visibility/basic chat access;
+        # elevated moderation/thread powers must come from the role's normal
+        # Discord permissions or a higher-level role, not from this overwrite.
+        overwrites[role] = ticket_role_access_overwrite()
 
     try:
         channel = await guild.create_text_channel(
@@ -3526,13 +3599,7 @@ class AddRoleModal(discord.ui.Modal, title="Add Role To Ticket"):
             await interaction.response.send_message("That role is not in this server.", ephemeral=True)
             return
 
-        overwrite = self.channel.overwrites_for(role)
-        overwrite.view_channel = True
-        overwrite.send_messages = True
-        overwrite.read_message_history = True
-        overwrite.attach_files = True
-        overwrite.embed_links = True
-        overwrite.mention_everyone = True
+        overwrite = ticket_role_access_overwrite()
 
         await self.channel.set_permissions(role, overwrite=overwrite, reason=f"Role added to ticket by {interaction.user}")
         notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
@@ -5012,6 +5079,45 @@ class TicketCommands(commands.Cog):
             embed.add_field(name="Test ping", value="No ping/access roles are configured to test.", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="ticketfixperms", description="Repair unsafe ticket channel role permissions.")
+    @app_commands.default_permissions(manage_channels=True)
+    @app_commands.describe(all_open="Repair every open ticket in configured ticket categories instead of only this ticket.")
+    async def ticketfixperms(self, interaction: discord.Interaction, all_open: bool = False) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+
+        if not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("You need Manage Channels to repair ticket permissions.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if all_open:
+            result = await repair_ticket_permissions_in_categories(self.bot, interaction.guild)
+            await interaction.followup.send(
+                "Ticket permission repair complete.\n"
+                f"Scanned tickets: `{result['scanned']}`\n"
+                f"Tickets changed: `{result['repaired_channels']}`\n"
+                f"Role overwrites repaired: `{result['repaired_roles']}`",
+                ephemeral=True,
+            )
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or not is_ticket_channel(channel):
+            await interaction.followup.send("Run this inside a ticket channel, or use `all_open:true`.", ephemeral=True)
+            return
+
+        result = await repair_ticket_permission_overwrites(self.bot, channel)
+        await interaction.followup.send(
+            "Ticket permission repair complete for this ticket.\n"
+            f"Role overwrites scanned: `{result['scanned']}`\n"
+            f"Role overwrites repaired: `{result['repaired']}`",
+            ephemeral=True,
+        )
+
 
     @app_commands.command(name="ticketadmin", description="Open the ticket admin control panel.")
     @app_commands.default_permissions(manage_guild=True)
