@@ -1845,6 +1845,30 @@ def set_auto_response(
     return entry, existed
 
 
+def edit_auto_response(
+    bot: "TicketBot",
+    guild_id: int,
+    *,
+    trigger: str,
+    response: str,
+    mode: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Edit an existing ticket auto-response without creating a new trigger."""
+    responses = get_auto_responses(bot, guild_id)
+    trigger_key = normalize_auto_response_trigger(trigger)
+    entry = responses.get(trigger_key)
+    if entry is None:
+        return None
+
+    entry["response"] = str(response or "").strip()[:1900]
+    if mode is not None and str(mode).strip():
+        entry["mode"] = normalize_auto_response_mode(mode)
+
+    responses[trigger_key] = entry
+    save_auto_responses(bot, guild_id, responses)
+    return entry
+
+
 def delete_auto_response(bot: "TicketBot", guild_id: int, trigger: str) -> Optional[dict[str, Any]]:
     responses = get_auto_responses(bot, guild_id)
     trigger_key = normalize_auto_response_trigger(trigger)
@@ -1926,6 +1950,19 @@ def auto_response_allowed_mentions() -> discord.AllowedMentions:
     return discord.AllowedMentions(everyone=False, users=True, roles=True, replied_user=False)
 
 
+def build_auto_response_embed(entry: dict[str, Any]) -> discord.Embed:
+    """Build the public ticket auto-response embed sent in reply to the user."""
+    response = str(entry.get("response") or "").strip()
+    embed = discord.Embed(
+        title="Support Auto-Response",
+        description=response[:4096] if response else "No response configured.",
+        color=discord.Color(STARZ_COLOR_BLUE),
+        timestamp=now_utc(),
+    )
+    embed.set_footer(text="This was sent automatically based on your ticket message.")
+    return embed
+
+
 def member_can_manage_auto_responses(bot: "TicketBot", member: discord.Member) -> bool:
     """Match ticket-admin style permissions without granting this to normal users."""
     return bool(
@@ -1998,7 +2035,7 @@ async def maybe_send_auto_response(bot: "TicketBot", message: discord.Message) -
 
     try:
         await message.reply(
-            response[:1900],
+            embed=build_auto_response_embed(entry),
             mention_author=False,
             allowed_mentions=auto_response_allowed_mentions(),
         )
@@ -3554,45 +3591,29 @@ def cached_ticket_staff_members_for_notes(
     *,
     extra_members: Optional[list[discord.Member]] = None,
 ) -> list[discord.Member]:
-    """Return cached staff members that should be added to this ticket's notes thread.
+    """Return only explicitly supplied staff members for notes-thread access.
 
-    Private threads do not grant role membership automatically. This helper adds
-    cached configured staff while keeping the ticket owner/player out of notes.
+    Earlier builds attempted to auto-add every cached member from ticket access
+    roles. That is unsafe on servers where VIP/customer/link roles accidentally
+    overlap with ticket access. Staff notes should stay private and only add the
+    staff member who explicitly opens `/snotes` or `/ticketnotes`.
     """
-    owner_id = get_ticket_owner_id(ticket_channel) or 0
     bot_id = int(getattr(getattr(guild, "me", None), "id", 0) or 0)
-    configured_staff_role_ids = set(get_role_ids_from_config(bot, guild.id, "normal_staff")) | set(get_role_ids_from_config(bot, guild.id, "priority_staff"))
     members: list[discord.Member] = []
     seen: set[int] = set()
 
     def add_member(member: Optional[discord.Member]) -> None:
         if member is None:
             return
-        if member.bot or member.id in {owner_id, bot_id} or member.id in seen:
+        if member.bot or member.id == bot_id or member.id in seen:
             return
-        member_role_ids = {role.id for role in getattr(member, "roles", [])}
-        if not (
-            (configured_staff_role_ids & member_role_ids)
-            or member.guild_permissions.manage_channels
-            or member.guild_permissions.administrator
-        ):
+        if not (member_is_staff(bot, member) or member.guild_permissions.manage_channels or member.guild_permissions.administrator):
             return
         seen.add(member.id)
         members.append(member)
 
     for member in extra_members or []:
         add_member(member)
-
-    for target, overwrite in ticket_channel.overwrites.items():
-        if isinstance(target, discord.Role) and not target.is_default() and overwrite.view_channel is True:
-            for member in getattr(target, "members", []):
-                add_member(member)
-        elif isinstance(target, discord.Member) and overwrite.view_channel is True:
-            add_member(target)
-
-    for role in unique_roles(get_staff_roles(bot, guild), get_priority_staff_roles(bot, guild)):
-        for member in getattr(role, "members", []):
-            add_member(member)
 
     return members
 
@@ -3604,7 +3625,12 @@ async def sync_notes_thread_staff(
     *,
     extra_members: Optional[list[discord.Member]] = None,
 ) -> int:
-    """Add all currently known ticket staff to a private staff-notes thread."""
+    """Add only explicitly supplied staff members to a private notes thread.
+
+    This intentionally does not scan ticket access roles, channel overwrites, or
+    cached role members. That prevents non-staff users from being pulled into
+    staff notes because of a misconfigured role.
+    """
     if notes_thread is None or not is_private_notes_thread(notes_thread):
         return 0
 
@@ -3694,9 +3720,10 @@ async def create_or_get_notes_thread(
     """Create or open this ticket's staff notes as a private attached thread.
 
     Private threads stay attached under the parent ticket channel for invited
-    staff, while keeping the ticket opener out of staff notes. The bot should
-    never create separate visible notes text channels or public notes threads as
-    the live notes destination.
+    staff, while keeping the ticket opener out of staff notes. Only the staff
+    member who runs `/snotes` or `/ticketnotes` is added automatically. The bot
+    should never create separate visible notes text channels or public notes
+    threads as the live notes destination.
     """
     existing = await get_notes_thread(bot, guild, channel)
     clean_notes_name = notes_channel_name(channel)
@@ -3741,7 +3768,8 @@ async def create_or_get_notes_thread(
 
     visibility_note = (
         "This is a **private staff-only thread** attached under the ticket channel. "
-        "Private threads are required because public threads can be seen by anyone who can view the parent ticket channel."
+        "Private threads are required because public threads can be seen by anyone who can view the parent ticket channel. "
+        "Only staff who run `/snotes` or `/ticketnotes` are added automatically."
     )
 
     legacy_notice = ""
@@ -4009,9 +4037,9 @@ class AddUserModal(discord.ui.Modal, title="Add User To Ticket"):
         overwrite.embed_links = True
 
         await self.channel.set_permissions(member, overwrite=overwrite, reason=f"Added to ticket by {interaction.user}")
-        notes_thread = await get_notes_thread(self.bot, interaction.guild, self.channel)
-        if notes_thread is not None:
-            await sync_notes_thread_staff(self.bot, self.channel, notes_thread, extra_members=[member])
+        # Do not add ticket-added users to staff notes automatically.
+        # Staff notes private-thread membership is granted only when a staff
+        # member explicitly opens `/snotes` or `/ticketnotes`.
         await self.channel.send(f"➕ {member.mention} was added to this ticket by {interaction.user.mention}.")
         await interaction.response.send_message(f"Added {member.mention} to the ticket.", ephemeral=True)
 
@@ -4787,9 +4815,8 @@ class TicketChannelView(discord.ui.View):
             reason=f"Ticket claimed by {interaction.user} ({interaction.user.id})",
         )
         await refresh_ticket_status_message(self.bot, channel, status="Claimed")
-        notes_thread = await get_notes_thread(self.bot, interaction.guild, channel)
-        if isinstance(notes_thread, discord.Thread):
-            await sync_notes_thread_staff(self.bot, channel, notes_thread, extra_members=[interaction.user])
+        # Claiming a ticket does not auto-add the claimer to staff notes.
+        # Run `/snotes` or `/ticketnotes` to join/open the private notes thread.
         claim_embed = build_ticket_event_embed(
             title="📌 Ticket Claimed",
             description=f"{interaction.user.mention} claimed this ticket.",
@@ -5750,11 +5777,11 @@ class AutoResponseCommands(commands.Cog):
             return None
         return interaction.user
 
-    @app_commands.command(name="autoresponseadd", description="Create or update a ticket keyword auto-response.")
+    @app_commands.command(name="autoresponseadd", description="Create a ticket keyword auto-response, or update it if it already exists.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         trigger="Word or phrase to match inside ticket messages.",
-        response="Message the bot should reply with when the trigger matches.",
+        response="Embed message the bot should reply with when the trigger matches.",
         mode="Optional: contains by default. Use exact to require the whole message to match.",
     )
     @app_commands.choices(
@@ -5809,6 +5836,65 @@ class AutoResponseCommands(commands.Cog):
         verb = "Updated" if existed else "Created"
         await interaction.response.send_message(
             f"{verb} auto-response for trigger `{entry['trigger']}`. Mode: `{entry['mode']}`. Enabled: `{entry['enabled']}`.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="autoresponseedit", description="Edit an existing ticket auto-response.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        trigger="Existing trigger to edit.",
+        response="New embed response text to send when the trigger matches.",
+        mode="Optional: leave blank to keep the current mode, or choose contains/exact.",
+    )
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="contains", value="contains"),
+            app_commands.Choice(name="exact", value="exact"),
+        ]
+    )
+    @app_commands.autocomplete(trigger=auto_response_trigger_autocomplete)
+    async def autoresponse_edit(
+        self,
+        interaction: discord.Interaction,
+        trigger: str,
+        response: str,
+        mode: str = "",
+    ) -> None:
+        manager = await self._require_manager(interaction)
+        if manager is None or interaction.guild is None:
+            return
+
+        clean_response = str(response or "").strip()
+        if not clean_response:
+            await interaction.response.send_message("Response cannot be empty.", ephemeral=True)
+            return
+        if len(clean_response) > 1900:
+            await interaction.response.send_message("Response must be 1900 characters or fewer.", ephemeral=True)
+            return
+
+        entry = edit_auto_response(
+            self.bot,
+            interaction.guild.id,
+            trigger=trigger,
+            response=clean_response,
+            mode=mode or None,
+        )
+        if entry is None:
+            await interaction.response.send_message(f"No auto-response trigger named `{truncate(trigger, 100)}` was found.", ephemeral=True)
+            return
+
+        await log_auto_response_change(
+            self.bot,
+            interaction.guild,
+            action="edited",
+            admin=manager,
+            entry=entry,
+        )
+
+        preview = build_auto_response_embed(entry)
+        await interaction.response.send_message(
+            f"Edited auto-response for trigger `{entry['trigger']}`. Mode: `{entry['mode']}`. Enabled: `{entry['enabled']}`. Preview:",
+            embed=preview,
             ephemeral=True,
         )
 
@@ -5908,11 +5994,13 @@ class AutoResponseCommands(commands.Cog):
             embed.add_field(name="Matched Trigger", value=f"`{match.get('trigger', '')}`", inline=True)
             embed.add_field(name="Mode", value=f"`{normalize_auto_response_mode(match.get('mode', 'contains'))}`", inline=True)
             embed.add_field(name="Response Preview", value=truncate(str(match.get("response") or ""), 1024), inline=False)
+            embed.set_footer(text="Live auto-responses are sent as embeds replying to the user's ticket message.")
         elif disabled_match is not None:
             embed.description = "This message matches a trigger, but that trigger is disabled."
             embed.add_field(name="Disabled Trigger", value=f"`{disabled_match.get('trigger', '')}`", inline=True)
             embed.add_field(name="Mode", value=f"`{normalize_auto_response_mode(disabled_match.get('mode', 'contains'))}`", inline=True)
             embed.add_field(name="Response Preview", value=truncate(str(disabled_match.get("response") or ""), 1024), inline=False)
+            embed.set_footer(text="Live auto-responses are sent as embeds replying to the user's ticket message.")
         else:
             embed.description = "No configured auto-response would match this message."
 
