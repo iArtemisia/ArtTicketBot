@@ -51,6 +51,11 @@ TICKET_USER_MENTION_FALLBACK = os.getenv("TICKET_USER_MENTION_FALLBACK", "false"
 TICKET_HERE_FALLBACK = os.getenv("TICKET_HERE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
+try:
+    AUTO_RESPONSE_COOLDOWN_SECONDS = max(5, int(os.getenv("AUTO_RESPONSE_COOLDOWN_SECONDS", "120").strip() or "120"))
+except ValueError:
+    AUTO_RESPONSE_COOLDOWN_SECONDS = 120
+
 TICKET_CONFIG: dict[str, str] = {
     "label": "Open Ticket",
     "emoji": "🎫",
@@ -1660,6 +1665,250 @@ def format_tag_list_for_embed(tags: dict[str, str]) -> str:
         return "No tags are saved yet."
     lines = [f"`{name}` — {truncate(value, 140)}" for name, value in sorted(tags.items())]
     return truncate("\n".join(lines), 4000)
+
+
+def normalize_auto_response_trigger(trigger: Any) -> str:
+    """Normalize a trigger key while preserving readable trigger text in config."""
+    value = re.sub(r"\s+", " ", str(trigger or "").strip())
+    return value.lower()
+
+
+def normalize_auto_response_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def normalize_auto_response_mode(mode: Any) -> str:
+    clean_mode = str(mode or "contains").strip().lower().replace("-", "_").replace(" ", "_")
+    if clean_mode in {"exact", "exact_phrase", "phrase", "full", "full_message"}:
+        return "exact"
+    return "contains"
+
+
+def get_auto_responses(bot: "TicketBot", guild_id: int) -> dict[str, dict[str, Any]]:
+    """Return enabled/disabled ticket auto-responses from this guild's config."""
+    config = bot.config_store.get_guild(guild_id)
+    raw = config.get("auto_responses", {})
+    if not isinstance(raw, dict):
+        return {}
+
+    cleaned: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_entry in raw.items():
+        if isinstance(raw_entry, dict):
+            trigger = normalize_auto_response_text(raw_entry.get("trigger") or raw_key)
+            response = str(raw_entry.get("response") or "").strip()
+            enabled = bool(raw_entry.get("enabled", True))
+            mode = normalize_auto_response_mode(raw_entry.get("mode", "contains"))
+        else:
+            trigger = normalize_auto_response_text(raw_key)
+            response = str(raw_entry or "").strip()
+            enabled = True
+            mode = "contains"
+
+        trigger_key = normalize_auto_response_trigger(trigger)
+        if not trigger_key or not response:
+            continue
+
+        cleaned[trigger_key] = {
+            "trigger": trigger[:100],
+            "response": response[:1900],
+            "enabled": enabled,
+            "mode": mode,
+        }
+
+    return cleaned
+
+
+def save_auto_responses(bot: "TicketBot", guild_id: int, responses: dict[str, dict[str, Any]]) -> None:
+    ordered = {
+        key: responses[key]
+        for key in sorted(responses.keys(), key=lambda item: responses[item].get("trigger", item).lower())
+    }
+    bot.config_store.update_guild(guild_id, auto_responses=ordered)
+
+
+def set_auto_response(
+    bot: "TicketBot",
+    guild_id: int,
+    *,
+    trigger: str,
+    response: str,
+    mode: str = "contains",
+) -> tuple[dict[str, Any], bool]:
+    responses = get_auto_responses(bot, guild_id)
+    clean_trigger = normalize_auto_response_text(trigger)[:100]
+    trigger_key = normalize_auto_response_trigger(clean_trigger)
+    existed = trigger_key in responses
+    previous = responses.get(trigger_key, {})
+    entry = {
+        "trigger": clean_trigger,
+        "response": str(response or "").strip()[:1900],
+        "enabled": bool(previous.get("enabled", True)),
+        "mode": normalize_auto_response_mode(mode),
+    }
+    responses[trigger_key] = entry
+    save_auto_responses(bot, guild_id, responses)
+    return entry, existed
+
+
+def delete_auto_response(bot: "TicketBot", guild_id: int, trigger: str) -> Optional[dict[str, Any]]:
+    responses = get_auto_responses(bot, guild_id)
+    trigger_key = normalize_auto_response_trigger(trigger)
+    removed = responses.pop(trigger_key, None)
+    if removed is not None:
+        save_auto_responses(bot, guild_id, responses)
+    return removed
+
+
+def toggle_auto_response(bot: "TicketBot", guild_id: int, trigger: str, enabled: bool) -> Optional[dict[str, Any]]:
+    responses = get_auto_responses(bot, guild_id)
+    trigger_key = normalize_auto_response_trigger(trigger)
+    entry = responses.get(trigger_key)
+    if entry is None:
+        return None
+
+    entry["enabled"] = bool(enabled)
+    responses[trigger_key] = entry
+    save_auto_responses(bot, guild_id, responses)
+    return entry
+
+
+def auto_response_choices(bot: "TicketBot", guild_id: int, current: str = "") -> list[app_commands.Choice[str]]:
+    query = normalize_auto_response_trigger(current)
+    choices: list[app_commands.Choice[str]] = []
+    for entry in get_auto_responses(bot, guild_id).values():
+        trigger = str(entry.get("trigger") or "").strip()
+        if not trigger:
+            continue
+        if query and query not in trigger.lower():
+            continue
+        choices.append(app_commands.Choice(name=trigger[:100], value=trigger[:100]))
+    choices.sort(key=lambda choice: choice.name.lower())
+    return choices[:25]
+
+
+async def auto_response_trigger_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if interaction.guild is None or not isinstance(interaction.client, TicketBot):
+        return []
+    return auto_response_choices(interaction.client, interaction.guild.id, current)
+
+
+def find_auto_response_match(
+    bot: "TicketBot",
+    guild_id: int,
+    message_text: str,
+    *,
+    include_disabled: bool = False,
+) -> Optional[dict[str, Any]]:
+    content = normalize_auto_response_trigger(message_text)
+    if not content:
+        return None
+
+    entries = list(get_auto_responses(bot, guild_id).values())
+    entries.sort(key=lambda item: len(normalize_auto_response_trigger(item.get("trigger", ""))), reverse=True)
+
+    for entry in entries:
+        if not include_disabled and not bool(entry.get("enabled", True)):
+            continue
+
+        trigger_key = normalize_auto_response_trigger(entry.get("trigger", ""))
+        if not trigger_key:
+            continue
+
+        mode = normalize_auto_response_mode(entry.get("mode", "contains"))
+        if mode == "exact":
+            matched = content == trigger_key
+        else:
+            matched = trigger_key in content
+
+        if matched:
+            return entry
+
+    return None
+
+
+def auto_response_allowed_mentions() -> discord.AllowedMentions:
+    """Allow configured user/role mentions, but never @everyone/@here."""
+    return discord.AllowedMentions(everyone=False, users=True, roles=True, replied_user=False)
+
+
+def member_can_manage_auto_responses(bot: "TicketBot", member: discord.Member) -> bool:
+    """Match ticket-admin style permissions without granting this to normal users."""
+    return bool(
+        member.guild_permissions.administrator
+        or member.guild_permissions.manage_guild
+        or member.guild_permissions.manage_channels
+    )
+
+
+async def log_auto_response_change(
+    bot: "TicketBot",
+    guild: discord.Guild,
+    *,
+    action: str,
+    admin: discord.Member,
+    entry: dict[str, Any],
+) -> None:
+    description = (
+        f"**Admin:** {admin.mention} (`{admin.id}`)\n"
+        f"**Trigger:** `{truncate(str(entry.get('trigger') or ''), 180)}`\n"
+        f"**Mode:** `{normalize_auto_response_mode(entry.get('mode', 'contains'))}`\n"
+        f"**Enabled:** `{bool(entry.get('enabled', True))}`\n"
+        f"**Response Preview:** {truncate(str(entry.get('response') or ''), 900)}"
+    )
+    try:
+        await log_event(
+            bot,
+            guild,
+            title=f"Auto-response {action}",
+            description=description,
+            color=discord.Color(STARZ_COLOR_BLUE),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def maybe_send_auto_response(bot: "TicketBot", message: discord.Message) -> None:
+    if message.guild is None or message.author.bot:
+        return
+    if not isinstance(message.channel, discord.TextChannel) or not is_ticket_channel(message.channel):
+        return
+
+    entry = find_auto_response_match(bot, message.guild.id, message.content or "")
+    if entry is None:
+        return
+
+    trigger_key = normalize_auto_response_trigger(entry.get("trigger", ""))
+    if not trigger_key:
+        return
+
+    cooldowns = getattr(bot, "auto_response_cooldowns", {})
+    cooldown_key = (int(message.guild.id), int(message.channel.id), trigger_key)
+    now = now_utc()
+    last_sent = cooldowns.get(cooldown_key)
+    if last_sent is not None and (now - last_sent).total_seconds() < AUTO_RESPONSE_COOLDOWN_SECONDS:
+        return
+
+    # Opportunistically prune stale cooldown entries for this ticket.
+    for key, sent_at in list(cooldowns.items()):
+        if len(key) == 3 and key[0] == message.guild.id and key[1] == message.channel.id:
+            if (now - sent_at).total_seconds() > max(AUTO_RESPONSE_COOLDOWN_SECONDS * 4, 600):
+                cooldowns.pop(key, None)
+
+    cooldowns[cooldown_key] = now
+    bot.auto_response_cooldowns = cooldowns
+
+    response = str(entry.get("response") or "").strip()
+    if not response:
+        return
+
+    try:
+        await message.reply(
+            response[:1900],
+            mention_author=False,
+            allowed_mentions=auto_response_allowed_mentions(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 def get_notes_thread_id(bot: "TicketBot", guild_id: int, ticket_channel_id: int) -> Optional[int]:
@@ -5168,6 +5417,13 @@ class TicketCommands(commands.Cog):
         embed.add_field(name="Panel Title", value=truncate(panel_message["title"], 1024), inline=True)
         embed.add_field(name="Panel Color", value=panel_message["color_hex"], inline=True)
         embed.add_field(name="Panel Message Preview", value=truncate(panel_message["description"], 1024), inline=False)
+        auto_responses = get_auto_responses(self.bot, interaction.guild.id)
+        enabled_auto_responses = [entry for entry in auto_responses.values() if bool(entry.get("enabled", True))]
+        embed.add_field(
+            name="Ticket Auto-Responses",
+            value=f"`{len(enabled_auto_responses)}` enabled / `{len(auto_responses)}` configured",
+            inline=False,
+        )
         embed.add_field(
             name="In-ticket controls",
             value="Ticket buttons shown in the private ticket: **Ping Team**, **Claim**, **Unclaim**, and **Close**. Ticket owners cannot claim, unclaim, or close their own tickets. Use `/ticketnotes` for staff notes.",
@@ -5219,6 +5475,188 @@ class TicketCommands(commands.Cog):
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+
+
+class AutoResponseCommands(commands.Cog):
+    def __init__(self, bot: "TicketBot"):
+        self.bot = bot
+
+    async def _require_manager(self, interaction: discord.Interaction) -> Optional[discord.Member]:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return None
+        if not member_can_manage_auto_responses(self.bot, interaction.user):
+            await interaction.response.send_message("You need ticket-admin permissions to manage auto-responses.", ephemeral=True)
+            return None
+        return interaction.user
+
+    @app_commands.command(name="autoresponseadd", description="Create or update a ticket keyword auto-response.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        trigger="Word or phrase to match inside ticket messages.",
+        response="Message the bot should reply with when the trigger matches.",
+        mode="Optional: contains by default. Use exact to require the whole message to match.",
+    )
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="contains", value="contains"),
+            app_commands.Choice(name="exact", value="exact"),
+        ]
+    )
+    async def autoresponse_add(
+        self,
+        interaction: discord.Interaction,
+        trigger: str,
+        response: str,
+        mode: str = "contains",
+    ) -> None:
+        manager = await self._require_manager(interaction)
+        if manager is None or interaction.guild is None:
+            return
+
+        clean_trigger = normalize_auto_response_text(trigger)
+        clean_response = str(response or "").strip()
+        clean_mode = normalize_auto_response_mode(mode)
+
+        if not clean_trigger:
+            await interaction.response.send_message("Trigger cannot be empty.", ephemeral=True)
+            return
+        if len(clean_trigger) > 100:
+            await interaction.response.send_message("Trigger must be 100 characters or fewer.", ephemeral=True)
+            return
+        if not clean_response:
+            await interaction.response.send_message("Response cannot be empty.", ephemeral=True)
+            return
+        if len(clean_response) > 1900:
+            await interaction.response.send_message("Response must be 1900 characters or fewer.", ephemeral=True)
+            return
+
+        entry, existed = set_auto_response(
+            self.bot,
+            interaction.guild.id,
+            trigger=clean_trigger,
+            response=clean_response,
+            mode=clean_mode,
+        )
+        await log_auto_response_change(
+            self.bot,
+            interaction.guild,
+            action="updated" if existed else "created",
+            admin=manager,
+            entry=entry,
+        )
+
+        verb = "Updated" if existed else "Created"
+        await interaction.response.send_message(
+            f"{verb} auto-response for trigger `{entry['trigger']}`. Mode: `{entry['mode']}`. Enabled: `{entry['enabled']}`.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="autoresponselist", description="List this server's ticket auto-responses.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def autoresponse_list(self, interaction: discord.Interaction) -> None:
+        manager = await self._require_manager(interaction)
+        if manager is None or interaction.guild is None:
+            return
+
+        responses = get_auto_responses(self.bot, interaction.guild.id)
+        embed = discord.Embed(
+            title="Ticket Auto-Responses",
+            color=discord.Color(STARZ_COLOR_BLUE),
+            timestamp=now_utc(),
+        )
+        if not responses:
+            embed.description = "No auto-responses are configured yet."
+        else:
+            lines: list[str] = []
+            for entry in responses.values():
+                state = "enabled" if bool(entry.get("enabled", True)) else "disabled"
+                lines.append(
+                    f"**{entry.get('trigger', '')}** — `{state}`, `{normalize_auto_response_mode(entry.get('mode', 'contains'))}`\n"
+                    f"{truncate(str(entry.get('response') or ''), 180)}"
+                )
+            embed.description = truncate("\n\n".join(lines), 4000)
+            embed.set_footer(text=f"{len(responses)} configured auto-response(s). Cooldown: {AUTO_RESPONSE_COOLDOWN_SECONDS}s per trigger per ticket.")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="autoresponsedelete", description="Delete a ticket auto-response trigger.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.autocomplete(trigger=auto_response_trigger_autocomplete)
+    async def autoresponse_delete(self, interaction: discord.Interaction, trigger: str) -> None:
+        manager = await self._require_manager(interaction)
+        if manager is None or interaction.guild is None:
+            return
+
+        removed = delete_auto_response(self.bot, interaction.guild.id, trigger)
+        if removed is None:
+            await interaction.response.send_message(f"No auto-response trigger named `{truncate(trigger, 100)}` was found.", ephemeral=True)
+            return
+
+        await log_auto_response_change(self.bot, interaction.guild, action="deleted", admin=manager, entry=removed)
+        await interaction.response.send_message(f"Deleted auto-response trigger `{removed['trigger']}`.", ephemeral=True)
+
+    @app_commands.command(name="autoresponsetoggle", description="Enable or disable a ticket auto-response trigger.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.autocomplete(trigger=auto_response_trigger_autocomplete)
+    async def autoresponse_toggle(self, interaction: discord.Interaction, trigger: str, enabled: bool) -> None:
+        manager = await self._require_manager(interaction)
+        if manager is None or interaction.guild is None:
+            return
+
+        entry = toggle_auto_response(self.bot, interaction.guild.id, trigger, enabled)
+        if entry is None:
+            await interaction.response.send_message(f"No auto-response trigger named `{truncate(trigger, 100)}` was found.", ephemeral=True)
+            return
+
+        await log_auto_response_change(
+            self.bot,
+            interaction.guild,
+            action="enabled" if enabled else "disabled",
+            admin=manager,
+            entry=entry,
+        )
+        await interaction.response.send_message(
+            f"Auto-response trigger `{entry['trigger']}` is now `{'enabled' if enabled else 'disabled'}`.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="autoresponsetest", description="Test which ticket auto-response would match a message.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(message="Message text to test against configured auto-response triggers.")
+    async def autoresponse_test(self, interaction: discord.Interaction, message: str) -> None:
+        manager = await self._require_manager(interaction)
+        if manager is None or interaction.guild is None:
+            return
+
+        match = find_auto_response_match(self.bot, interaction.guild.id, message, include_disabled=False)
+        disabled_match = None
+        if match is None:
+            candidate = find_auto_response_match(self.bot, interaction.guild.id, message, include_disabled=True)
+            if candidate is not None and not bool(candidate.get("enabled", True)):
+                disabled_match = candidate
+
+        embed = discord.Embed(
+            title="Auto-Response Test",
+            color=discord.Color(STARZ_COLOR_BLUE),
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="Test Message", value=truncate(message, 1024) or "None", inline=False)
+
+        if match is not None:
+            embed.description = "This message would trigger an enabled auto-response."
+            embed.add_field(name="Matched Trigger", value=f"`{match.get('trigger', '')}`", inline=True)
+            embed.add_field(name="Mode", value=f"`{normalize_auto_response_mode(match.get('mode', 'contains'))}`", inline=True)
+            embed.add_field(name="Response Preview", value=truncate(str(match.get("response") or ""), 1024), inline=False)
+        elif disabled_match is not None:
+            embed.description = "This message matches a trigger, but that trigger is disabled."
+            embed.add_field(name="Disabled Trigger", value=f"`{disabled_match.get('trigger', '')}`", inline=True)
+            embed.add_field(name="Mode", value=f"`{normalize_auto_response_mode(disabled_match.get('mode', 'contains'))}`", inline=True)
+            embed.add_field(name="Response Preview", value=truncate(str(disabled_match.get("response") or ""), 1024), inline=False)
+        else:
+            embed.description = "No configured auto-response would match this message."
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class TagCreateModal(discord.ui.Modal, title="Create Tag"):
@@ -5565,6 +6003,7 @@ class TicketBot(commands.Bot):
         self.config_store = GuildConfigStore(CONFIG_PATH)
         self.stats_store = TicketStatsStore(TICKET_STATS_PATH)
         self.ticket_ping_cooldowns: dict[int, datetime] = {}
+        self.auto_response_cooldowns: dict[tuple[int, int, str], datetime] = {}
         self.closing_ticket_ids: set[int] = set()
 
     async def setup_hook(self) -> None:
@@ -5572,6 +6011,7 @@ class TicketBot(commands.Bot):
         self.add_view(TicketChannelView(self))
         await self.add_cog(TicketCommands(self))
         await self.add_cog(StarzShortcutCommands(self))
+        await self.add_cog(AutoResponseCommands(self))
         await self.add_cog(TagCommands(self))
         await self.add_cog(StatsCommands(self))
         await self.tree.sync()
@@ -5595,6 +6035,7 @@ class TicketBot(commands.Bot):
             if member_is_staff(self, message.author):
                 self.stats_store.ensure_ticket_from_channel(channel)
                 self.stats_store.record_staff_message(message.guild.id, channel.id, message.author.id, message.created_at)
+            await maybe_send_auto_response(self, message)
 
         await self.process_commands(message)
 
