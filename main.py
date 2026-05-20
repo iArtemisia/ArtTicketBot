@@ -56,6 +56,13 @@ try:
 except ValueError:
     AUTO_RESPONSE_COOLDOWN_SECONDS = 120
 
+# Per-user anti-spam cooldown for ticket auto-responses. This prevents one
+# player from repeatedly triggering the same auto-response in the same ticket.
+try:
+    AUTO_RESPONSE_USER_COOLDOWN_SECONDS = max(60, int(os.getenv("AUTO_RESPONSE_USER_COOLDOWN_SECONDS", "600").strip() or "600"))
+except ValueError:
+    AUTO_RESPONSE_USER_COOLDOWN_SECONDS = 600
+
 TICKET_CONFIG: dict[str, str] = {
     "label": "Open Ticket",
     "emoji": "🎫",
@@ -2013,25 +2020,45 @@ async def maybe_send_auto_response(bot: "TicketBot", message: discord.Message) -
     if not trigger_key:
         return
 
-    cooldowns = getattr(bot, "auto_response_cooldowns", {})
-    cooldown_key = (int(message.guild.id), int(message.channel.id), trigger_key)
-    now = now_utc()
-    last_sent = cooldowns.get(cooldown_key)
-    if last_sent is not None and (now - last_sent).total_seconds() < AUTO_RESPONSE_COOLDOWN_SECONDS:
-        return
-
-    # Opportunistically prune stale cooldown entries for this ticket.
-    for key, sent_at in list(cooldowns.items()):
-        if len(key) == 3 and key[0] == message.guild.id and key[1] == message.channel.id:
-            if (now - sent_at).total_seconds() > max(AUTO_RESPONSE_COOLDOWN_SECONDS * 4, 600):
-                cooldowns.pop(key, None)
-
-    cooldowns[cooldown_key] = now
-    bot.auto_response_cooldowns = cooldowns
-
     response = str(entry.get("response") or "").strip()
     if not response:
         return
+
+    now = now_utc()
+
+    # Existing ticket-level cooldown: prevents the same trigger from repeatedly
+    # firing across the same ticket too quickly.
+    cooldowns = getattr(bot, "auto_response_cooldowns", {})
+    ticket_cooldown_key = (int(message.guild.id), int(message.channel.id), trigger_key)
+    last_ticket_sent = cooldowns.get(ticket_cooldown_key)
+    if last_ticket_sent is not None and (now - last_ticket_sent).total_seconds() < AUTO_RESPONSE_COOLDOWN_SECONDS:
+        return
+
+    # New user-level cooldown: prevents one player from spamming a trigger word
+    # over and over in the same ticket. Default is 10 minutes.
+    user_cooldowns = getattr(bot, "auto_response_user_cooldowns", {})
+    user_cooldown_key = (int(message.guild.id), int(message.channel.id), int(message.author.id), trigger_key)
+    last_user_sent = user_cooldowns.get(user_cooldown_key)
+    if last_user_sent is not None and (now - last_user_sent).total_seconds() < AUTO_RESPONSE_USER_COOLDOWN_SECONDS:
+        return
+
+    # Opportunistically prune stale cooldown entries for this ticket.
+    max_ticket_age = max(AUTO_RESPONSE_COOLDOWN_SECONDS * 4, 600)
+    for key, sent_at in list(cooldowns.items()):
+        if len(key) == 3 and key[0] == message.guild.id and key[1] == message.channel.id:
+            if (now - sent_at).total_seconds() > max_ticket_age:
+                cooldowns.pop(key, None)
+
+    max_user_age = max(AUTO_RESPONSE_USER_COOLDOWN_SECONDS * 2, 1200)
+    for key, sent_at in list(user_cooldowns.items()):
+        if len(key) == 4 and key[0] == message.guild.id and key[1] == message.channel.id:
+            if (now - sent_at).total_seconds() > max_user_age:
+                user_cooldowns.pop(key, None)
+
+    cooldowns[ticket_cooldown_key] = now
+    user_cooldowns[user_cooldown_key] = now
+    bot.auto_response_cooldowns = cooldowns
+    bot.auto_response_user_cooldowns = user_cooldowns
 
     try:
         await message.reply(
@@ -5922,7 +5949,7 @@ class AutoResponseCommands(commands.Cog):
                     f"{truncate(str(entry.get('response') or ''), 180)}"
                 )
             embed.description = truncate("\n\n".join(lines), 4000)
-            embed.set_footer(text=f"{len(responses)} configured auto-response(s). Cooldown: {AUTO_RESPONSE_COOLDOWN_SECONDS}s per trigger per ticket.")
+            embed.set_footer(text=f"{len(responses)} configured auto-response(s). Ticket cooldown: {AUTO_RESPONSE_COOLDOWN_SECONDS}s. User cooldown: {AUTO_RESPONSE_USER_COOLDOWN_SECONDS}s.")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -5994,13 +6021,13 @@ class AutoResponseCommands(commands.Cog):
             embed.add_field(name="Matched Trigger", value=f"`{match.get('trigger', '')}`", inline=True)
             embed.add_field(name="Mode", value=f"`{normalize_auto_response_mode(match.get('mode', 'contains'))}`", inline=True)
             embed.add_field(name="Response Preview", value=truncate(str(match.get("response") or ""), 1024), inline=False)
-            embed.set_footer(text="Live auto-responses are sent as embeds replying to the user's ticket message.")
+            embed.set_footer(text=f"Live auto-responses are sent as embeds. User cooldown: {AUTO_RESPONSE_USER_COOLDOWN_SECONDS}s.")
         elif disabled_match is not None:
             embed.description = "This message matches a trigger, but that trigger is disabled."
             embed.add_field(name="Disabled Trigger", value=f"`{disabled_match.get('trigger', '')}`", inline=True)
             embed.add_field(name="Mode", value=f"`{normalize_auto_response_mode(disabled_match.get('mode', 'contains'))}`", inline=True)
             embed.add_field(name="Response Preview", value=truncate(str(disabled_match.get("response") or ""), 1024), inline=False)
-            embed.set_footer(text="Live auto-responses are sent as embeds replying to the user's ticket message.")
+            embed.set_footer(text=f"Live auto-responses are sent as embeds. User cooldown: {AUTO_RESPONSE_USER_COOLDOWN_SECONDS}s.")
         else:
             embed.description = "No configured auto-response would match this message."
 
@@ -6356,6 +6383,7 @@ class TicketBot(commands.Bot):
         self.stats_store = TicketStatsStore(TICKET_STATS_PATH)
         self.ticket_ping_cooldowns: dict[int, datetime] = {}
         self.auto_response_cooldowns: dict[tuple[int, int, str], datetime] = {}
+        self.auto_response_user_cooldowns: dict[tuple[int, int, int, str], datetime] = {}
         self.closing_ticket_ids: set[int] = set()
 
     async def setup_hook(self) -> None:
